@@ -1,0 +1,70 @@
+# Disgaea DS Manager — macOS 14 Build
+# Requires: brew install qt@6
+CXX      := clang++
+CXXSTD   := c++20
+QT_PREFIX := $(shell brew --prefix qt@6 2>/dev/null || echo /opt/homebrew/opt/qt@6)
+MOC      := $(QT_PREFIX)/bin/moc
+RCC      := $(QT_PREFIX)/bin/rcc
+AUTOMOC  := $(MOC)
+
+CXXFLAGS := -std=$(CXXSTD) -O2 -Wall -Wextra \
+            -F$(QT_PREFIX)/lib \
+            -Iinclude \
+            -I$(QT_PREFIX)/include \
+            -I$(QT_PREFIX)/include/QtWidgets \
+            -I$(QT_PREFIX)/include/QtCore \
+            -I$(QT_PREFIX)/include/QtGui
+
+LDFLAGS  := -F$(QT_PREFIX)/lib \
+            -framework QtWidgets -framework QtCore -framework QtGui \
+            -Wl,-rpath,$(QT_PREFIX)/lib
+
+SRC := main.cpp \
+      src2/formats.cpp \
+      src2/reader.cpp \
+      src2/writer.cpp \
+      src2/commands.cpp \
+      src2/document_manager.cpp \
+      src2/extraction.cpp \
+      src2/folder_import.cpp \
+      src2/dialog_service.cpp \
+      src2/main_window.cpp
+
+# moc-generated sources
+MOC_HDRS := src2/include/main_window.hpp
+MOC_SRCS := $(MOC_HDRS:include/%.hpp=build/moc_%.cpp)
+
+TARGET   := DisgaeaDSManager
+BUILD    := build
+OBJS     := $(SRC:%.cpp=$(BUILD)/%.o) $(MOC_SRCS:%.cpp=$(BUILD)/%.o)
+
+.PHONY: all clean run
+
+all: $(TARGET)
+
+# Run moc on headers
+$(BUILD)/moc_%.cpp: src2/include/%.hpp | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(MOC) $< -o $@
+
+# Compile regular sources
+$(BUILD)/%.o: %.cpp | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Compile moc sources
+$(BUILD)/moc_%.o: $(BUILD)/moc_%.cpp | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(TARGET): $(OBJS)
+	$(CXX) $(OBJS) $(LDFLAGS) -o $(TARGET)
+
+$(BUILD):
+	@mkdir -p $(BUILD)/src
+
+clean:
+	rm -rf $(BUILD) $(TARGET)
+
+run: all
+	./$(TARGET)
