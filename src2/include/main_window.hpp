@@ -1,3 +1,4 @@
+#pragma once
 #include "main_window.hpp"
 #include "dialog_service.hpp"
 #include <QMenuBar>
