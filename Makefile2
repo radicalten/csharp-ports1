@@ -1,25 +1,37 @@
 # Disgaea DS Manager — macOS 14 Build
-CXX      := clang++
-CXXSTD   := c++20
-QT_PREFIX := $(shell brew --prefix qt@6 2>/dev/null || echo /opt/homebrew/opt/qt@6)
-MOC      := $(QT_PREFIX)/bin/moc
+CXX := clang++
+CXXSTD := c++20
 
-CXXFLAGS := -std=$(CXXSTD) -O2 -Wall -Wextra \
-            -F$(QT_PREFIX)/lib \
-            -Iinclude \
-            -I$(QT_PREFIX)/include \
-            -I$(QT_PREFIX)/include/QtWidgets \
-            -I$(QT_PREFIX)/include/QtCore \
-            -I$(QT_PREFIX)/include/QtGui
+# Auto-detect Homebrew prefix (Apple Silicon or Intel)
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+QT_PREFIX   := $(shell brew --prefix qt@6 2>/dev/null || echo $(BREW_PREFIX)/opt/qt@6)
 
-LDFLAGS  := -F$(QT_PREFIX)/lib \
-            -framework QtWidgets -framework QtCore -framework QtGui \
-            -Wl,-rpath,$(QT_PREFIX)/lib
+# Use pkg-config from Qt6 to get exact flags (fallback to manual)
+PKG_CONFIG := $(QT_PREFIX)/bin/qt-cmake  # not used directly
+QT_INC     := $(shell PKG_CONFIG_PATH=$(QT_PREFIX)/lib/pkgconfig pkg-config --cflags Qt6Widgets 2>/dev/null)
+QT_LIB     := $(shell PKG_CONFIG_PATH=$(QT_PREFIX)/lib/pkgconfig pkg-config --libs Qt6Widgets 2>/dev/null)
+
+# Fallback if pkg-config fails
+ifeq ($(QT_INC),)
+QT_INC := -F$(QT_PREFIX)/lib \
+          -I$(QT_PREFIX)/include \
+          -I$(QT_PREFIX)/include/QtWidgets \
+          -I$(QT_PREFIX)/include/QtCore \
+          -I$(QT_PREFIX)/include/QtGui
+endif
+
+ifeq ($(QT_LIB),)
+QT_LIB := -F$(QT_PREFIX)/lib \
+          -framework QtWidgets -framework QtCore -framework QtGui \
+          -Wl,-rpath,$(QT_PREFIX)/lib
+endif
+
+CXXFLAGS := -std=$(CXXSTD) -O2 -Wall -Wextra $(QT_INC) -Iinclude
+LDFLAGS  := $(QT_LIB)
 
 BUILD := build
 TARGET := DisgaeaDSManager
 
-# Source files (root + src/)
 SRC := src2/main.cpp \
       src2/formats.cpp \
       src2/reader.cpp \
@@ -31,28 +43,24 @@ SRC := src2/main.cpp \
       src2/dialog_service.cpp \
       src2/main_window.cpp
 
-# Object files: keep same relative dir under build/
 OBJS := $(addprefix $(BUILD)/, $(SRC:.cpp=.o))
-
-# moc-generated source from header
 MOC_SRC := $(BUILD)/moc_main_window.cpp
 OBJS    += $(MOC_SRC:.cpp=.o)
+
+MOC := $(QT_PREFIX)/bin/moc
 
 .PHONY: all clean run app
 
 all: $(TARGET)
 
-# moc step
 $(BUILD)/moc_%.cpp: include/%.hpp | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(MOC) $< -o $@
 
-# Generic compile: build/xxx.o from xxx.cpp (works for root and src/)
 $(BUILD)/%.o: %.cpp | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Compile moc output
 $(BUILD)/moc_main_window.o: $(BUILD)/moc_main_window.cpp | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
