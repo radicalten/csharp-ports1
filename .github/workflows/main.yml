@@ -13,6 +13,10 @@ jobs:
       run: |
           brew update
           brew install qt@6
+    - name: Set Qt Environment
+      run: |
+          echo "QT_PREFIX=$(brew --prefix qt@6)" >> "$GITHUB_ENV"
+          echo "$(brew --prefix qt@6)/bin" >> "$GITHUB_PATH"
     - name: Compile
       run: |
         make -f Makefile
