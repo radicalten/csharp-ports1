@@ -19,8 +19,7 @@ LDFLAGS := $(CXXFLAGS) \
 MOC_HDRS := include/main_window.hpp
 MOC_SRCS := $(MOC_HDRS:include/%.hpp=build/moc_%.cpp)
 TARGET  := myapp
-BUILD    := build
 SRCS    := $(wildcard src2/*.cpp)
-OBJS    := $(patsubst %.c,%.o,$(SRCS)) $(MOC_SRCS:%.cpp=$(BUILD)/%.o)
+OBJS    := $(patsubst %.c,%.o,$(SRCS)) $(MOC_SRCS:%.cpp=build/%.o)
 all: $(OBJS)
 	$(CXX) $(OBJS) $(CXXFLAGS) $(LDFLAGS) -o $(TARGET) 
