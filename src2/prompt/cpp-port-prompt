@@ -1,0 +1,3893 @@
+//App.axaml
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Disgaea_DS_Manager.App"
+             RequestedThemeVariant="Default">
+    <Application.Styles>
+        <FluentTheme />
+    </Application.Styles>
+</Application>
+
+//App.axaml.cs
+using Avalonia;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Markup.Xaml;
+namespace Disgaea_DS_Manager;
+
+public partial class App : Application
+{
+    public override void Initialize()
+    {
+        AvaloniaXamlLoader.Load(this);
+    }
+    public override void OnFrameworkInitializationCompleted()
+    {
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            desktop.MainWindow = new MainWindow();
+        }
+        base.OnFrameworkInitializationCompleted();
+    }
+}
+
+//ArchiveModels.cs
+using System.Buffers;
+using System.Text;
+namespace Disgaea_DS_Manager.Models;
+
+public enum ArchiveType { DSARC, MSND }
+public sealed record ArchiveDocument
+{
+    public string? FilePath { get; init; }
+    public ArchiveType FileType { get; init; }
+    public ArchiveEntry RootEntry { get; init; } = new() { Name = "[Root]" };
+    public bool IsModified { get; init; }
+    public string? OriginalFilePath { get; init; }
+    public bool HasContent { get; init; }
+    public List<ArchiveEntry> GetAllEntries()
+    {
+        List<ArchiveEntry> result = new(16);
+        CollectEntries(RootEntry, result);
+        return result;
+    }
+    private static void CollectEntries(ArchiveEntry entry, List<ArchiveEntry> list)
+    {
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            list.Add(child);
+            if (child.Children.Count > 0)
+            {
+                CollectEntries(child, list);
+            }
+        }
+    }
+    public ArchiveDocument DeepCopy()
+    {
+        return this with { RootEntry = RootEntry.DeepCopy() };
+    }
+}
+public sealed class ArchiveEntry
+{
+    private static long _nextId;
+    public long Id { get; private set; } = Interlocked.Increment(ref _nextId);
+    public string Name { get; set; } = string.Empty;
+    public int Size { get; set; }
+    public int Offset { get; set; }
+    public ArchiveType? NestedType { get; set; }
+    public IDataSource? DataSource { get; set; }
+    public List<ArchiveEntry> Children { get; set; } = [];
+    public bool IsModified { get; set; }
+    public int ImportOrder { get; set; }
+    public bool IsNested => NestedType.HasValue;
+    public string DisplayName => IsModified ? $"{Name} *" : Name;
+    public async Task<byte[]> GetDataAsync(CancellationToken ct = default)
+    {
+        return DataSource is null
+            ? throw new InvalidOperationException($"Entry '{Name}' has no data source.")
+            : await DataSource.GetDataAsync(ct).ConfigureAwait(false);
+    }
+    public ArchiveEntry DeepCopy()
+    {
+        return new()
+        {
+            Id = Id,
+            Name = Name,
+            Size = Size,
+            Offset = Offset,
+            NestedType = NestedType,
+            DataSource = DataSource,
+            IsModified = IsModified,
+            ImportOrder = ImportOrder,
+            Children = [.. Children.Select(c => c.DeepCopy())]
+        };
+    }
+    public ArchiveEntry DeepCopyWithNewId()
+    {
+        return new()
+        {
+            Name = Name,
+            Size = Size,
+            Offset = Offset,
+            NestedType = NestedType,
+            DataSource = DataSource,
+            IsModified = IsModified,
+            ImportOrder = ImportOrder,
+            Children = [.. Children.Select(c => c.DeepCopyWithNewId())]
+        };
+    }
+}
+public interface IDataSource
+{
+    Task<byte[]> GetDataAsync(CancellationToken ct = default);
+}
+public sealed class FileRangeSource(string path, long offset, int size) : IDataSource
+{
+    public async Task<byte[]> GetDataAsync(CancellationToken ct = default)
+    {
+        byte[] buffer = new byte[size];
+        await using FileStream fs = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        _ = fs.Seek(offset, SeekOrigin.Begin);
+        await fs.ReadExactlyAsync(buffer, ct).ConfigureAwait(false);
+        return buffer;
+    }
+}
+public sealed class BufferSource(byte[] data) : IDataSource
+{
+    public Task<byte[]> GetDataAsync(CancellationToken ct = default)
+    {
+        return Task.FromResult(data);
+    }
+}
+public sealed class ImportResult
+{
+    public ArchiveType FileType { get; set; }
+    public List<ArchiveEntry> Entries { get; } = [];
+    public required string SourceFolder { get; set; }
+}
+public static class Formats
+{
+    public const int NameSize = 40;
+    public const int DsarcHeader = 16;
+    public const int DsarcEntryInfo = 8;
+    public const int DsarcVersion = 1;
+    public const int MsndHeader = 48;
+    public const int MsndUnknownOffset = 0x2C;
+    public static readonly byte[] MagicDsarc = [0x44, 0x53, 0x41, 0x52, 0x43, 0x20, 0x46, 0x4C];
+    public static readonly byte[] MagicMsnd = [0x44, 0x53, 0x45, 0x51];
+    public static readonly string[] MsndOrder = [".sseq", ".sbnk", ".swar"];
+    private static readonly ArrayPool<byte> Pool = ArrayPool<byte>.Shared;
+    public static byte[] PadName(string name)
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes(name ?? string.Empty);
+        if (bytes.Length > NameSize)
+        {
+            bytes = bytes[..NameSize];
+        }
+        byte[] result = new byte[NameSize];
+        bytes.CopyTo(result, 0);
+        return result;
+    }
+    public static string GuessExtension(ReadOnlySpan<byte> data, string fallback)
+    {
+        return data.Length < 4
+            ? fallback
+            : (data[0], data[1], data[2], data[3]) switch
+            {
+                (0x53, 0x57, 0x41, 0x56) => ".swav",
+                (0x53, 0x54, 0x52, 0x4D) => ".strm",
+                _ => fallback
+            };
+    }
+    public static ArchiveType DetectType(string path)
+    {
+        byte[] magic = Pool.Rent(8);
+        try
+        {
+            using FileStream fs = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 8, FileOptions.SequentialScan);
+            int read = fs.Read(magic, 0, 8);
+            return read < 4
+                ? throw new InvalidDataException("Cannot read file header.")
+                : magic.AsSpan(0, 4).SequenceEqual(MagicMsnd)
+                ? ArchiveType.MSND
+                : read >= 8 && magic.AsSpan(0, 8).SequenceEqual(MagicDsarc)
+                ? ArchiveType.DSARC
+                : throw new InvalidDataException("Unknown archive format.");
+        }
+        finally { Pool.Return(magic); }
+    }
+    public static ArchiveType? DetectTypeFromBuffer(ReadOnlySpan<byte> data)
+    {
+        return data.Length >= 8 && data[..8].SequenceEqual(MagicDsarc)
+            ? ArchiveType.DSARC
+            : data.Length >= 4 && data[..4].SequenceEqual(MagicMsnd) ? ArchiveType.MSND : null;
+    }
+    public static MsndOffsets ParseMsndOffsets(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < MsndHeader)
+        {
+            throw new InvalidDataException("Buffer too small for MSND header.");
+        }
+        int sseqOff = BitConverter.ToInt32(data[16..]) - 16;
+        int sbnkOff = BitConverter.ToInt32(data[20..]);
+        int swarOff = BitConverter.ToInt32(data[24..]);
+        int sseqSz = BitConverter.ToInt32(data[32..]);
+        int sbnkSz = BitConverter.ToInt32(data[36..]);
+        int swarSz = BitConverter.ToInt32(data[40..]);
+        return new MsndOffsets(sseqOff, sbnkOff, swarOff, sseqSz, sbnkSz, swarSz);
+    }
+    public static bool AreMsndBoundsValid(int length, MsndOffsets offsets)
+    {
+        return offsets.SseqOffset >= 0 && offsets.SseqSize >= 0 && offsets.SseqOffset + offsets.SseqSize <= length &&
+               offsets.SbnkOffset >= 0 && offsets.SbnkSize >= 0 && offsets.SbnkOffset + offsets.SbnkSize <= length &&
+               offsets.SwarOffset >= 0 && offsets.SwarSize >= 0 && offsets.SwarOffset + offsets.SwarSize <= length;
+    }
+    public static void PopulateMsndChildren(byte[] data, ArchiveEntry parent, string baseName)
+    {
+        MsndOffsets offsets = ParseMsndOffsets(data);
+        if (!AreMsndBoundsValid(data.Length, offsets))
+        {
+            return;
+        }
+        parent.Children.Clear();
+        parent.Children.Add(CreateMsndChildEntry($"{baseName}.sseq", data, offsets.SseqOffset, offsets.SseqSize));
+        parent.Children.Add(CreateMsndChildEntry($"{baseName}.sbnk", data, offsets.SbnkOffset, offsets.SbnkSize));
+        parent.Children.Add(CreateMsndChildEntry($"{baseName}.swar", data, offsets.SwarOffset, offsets.SwarSize));
+    }
+    public static ArchiveEntry CreateMsndChildEntry(string name, byte[] buf, int offset, int size)
+    {
+        return new()
+        {
+            Name = name,
+            Size = size,
+            Offset = offset,
+            DataSource = new BufferSource(buf[offset..(offset + size)])
+        };
+    }
+    public static byte[] BuildMsnd(Dictionary<string, byte[]> chunks, byte[]? unknownBytes = null)
+    {
+        foreach (string ext in MsndOrder)
+        {
+            if (!chunks.ContainsKey(ext))
+            {
+                throw new InvalidOperationException($"Missing MSND chunk: {ext}");
+            }
+        }
+        byte[] sseq = chunks[".sseq"];
+        byte[] sbnk = chunks[".sbnk"];
+        byte[] swar = chunks[".swar"];
+        int sseqOff = MsndHeader;
+        int sbnkOff = sseqOff + sseq.Length;
+        int swarOff = sbnkOff + sbnk.Length;
+        using MemoryStream ms = new(MsndHeader + sseq.Length + sbnk.Length + swar.Length);
+        using BinaryWriter bw = new(ms);
+        bw.Write(MagicMsnd);
+        bw.Write(new byte[12]);
+        bw.Write(sseqOff + 16);
+        bw.Write(sbnkOff);
+        bw.Write(swarOff);
+        bw.Write(0);
+        bw.Write(sseq.Length);
+        bw.Write(sbnk.Length);
+        bw.Write(swar.Length);
+        bw.Write(unknownBytes is { Length: 4 } ? unknownBytes : new byte[4]);
+        bw.Write(sseq);
+        bw.Write(sbnk);
+        bw.Write(swar);
+        return ms.ToArray();
+    }
+    public static byte[] BuildEmptyMsnd()
+    {
+        using MemoryStream ms = new(MsndHeader);
+        using BinaryWriter bw = new(ms);
+        bw.Write(MagicMsnd);
+        bw.Write(new byte[12]);
+        int sseqOff = MsndHeader;
+        bw.Write(sseqOff + 16);
+        bw.Write(sseqOff);
+        bw.Write(sseqOff);
+        bw.Write(0);
+        bw.Write(0);
+        bw.Write(0);
+        bw.Write(0);
+        bw.Write(new byte[4]);
+        return ms.ToArray();
+    }
+    public static byte[] ExtractMsndUnknownBytes(ReadOnlySpan<byte> msndData)
+    {
+        return msndData.Length < MsndHeader ? new byte[4] : msndData[MsndUnknownOffset..(MsndUnknownOffset + 4)].ToArray();
+    }
+}
+public readonly record struct MsndOffsets(int SseqOffset, int SbnkOffset, int SwarOffset, int SseqSize, int SbnkSize, int SwarSize);
+
+//ArchiveReaderService.s
+using Disgaea_DS_Manager.Models;
+using System.Text;
+namespace Disgaea_DS_Manager.Services;
+
+public sealed class ArchiveReaderService
+{
+    public async Task<ArchiveDocument> ParseAsync(string path, CancellationToken ct = default)
+    {
+        ArchiveType type = Formats.DetectType(path);
+        byte[] data = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+        return type switch
+        {
+            ArchiveType.MSND => ParseMsnd(data, path),
+            ArchiveType.DSARC => ParseDsarc(data, path),
+            _ => throw new NotSupportedException("Unknown archive type")
+        };
+    }
+    public ArchiveDocument ParseFromBuffer(byte[] data, string virtualPath)
+    {
+        ArchiveType type = Formats.DetectTypeFromBuffer(data)
+            ?? throw new InvalidDataException("Unknown buffer format.");
+        return type switch
+        {
+            ArchiveType.MSND => ParseMsnd(data, virtualPath),
+            ArchiveType.DSARC => ParseDsarc(data, virtualPath),
+            _ => throw new NotSupportedException()
+        };
+    }
+    private static ArchiveDocument ParseDsarc(byte[] buf, string path)
+    {
+        if (buf.Length < Formats.DsarcHeader || !buf.AsSpan(0, 8).SequenceEqual(Formats.MagicDsarc))
+        {
+            throw new InvalidDataException("Invalid DSARC header.");
+        }
+        int count = BitConverter.ToInt32(buf, 8);
+        int version = BitConverter.ToInt32(buf, 12);
+        if (version != Formats.DsarcVersion)
+        {
+            throw new NotSupportedException($"Unsupported DSARC version: {version}");
+        }
+        ArchiveEntry root = new() { Name = Path.GetFileName(path) };
+        int pos = Formats.DsarcHeader;
+        for (int i = 0; i < count; i++)
+        {
+            ReadOnlySpan<byte> nameBytes = buf.AsSpan(pos, Formats.NameSize);
+            string name = Encoding.UTF8.GetString(nameBytes).Split('\0')[0].Trim();
+            if (string.IsNullOrEmpty(name))
+            {
+                name = $"file_{i}";
+            }
+            pos += Formats.NameSize;
+            int size = BitConverter.ToInt32(buf, pos);
+            int offset = BitConverter.ToInt32(buf, pos + 4);
+            pos += Formats.DsarcEntryInfo;
+            if (offset < 0 || size < 0 || offset + size > buf.Length)
+            {
+                throw new InvalidDataException($"Entry '{name}' exceeds archive bounds.");
+            }
+            ArchiveEntry entry = new()
+            {
+                Name = name,
+                Size = size,
+                Offset = offset,
+                ImportOrder = i,
+                DataSource = new BufferSource(buf[offset..(offset + size)])
+            };
+            ReadOnlySpan<byte> entryData = buf.AsSpan(offset, Math.Min(size, 8));
+            if (size >= 4 && entryData[..4].SequenceEqual(Formats.MagicMsnd))
+            {
+                entry.NestedType = ArchiveType.MSND;
+                ParseMsndChildren(buf.AsSpan(offset, size), entry, name);
+            }
+            else if (size >= 8 && entryData[..8].SequenceEqual(Formats.MagicDsarc))
+            {
+                entry.NestedType = ArchiveType.DSARC;
+                ParseDsarcChildren(buf.AsSpan(offset, size), entry, name);
+            }
+            root.Children.Add(entry);
+        }
+        return new ArchiveDocument
+        {
+            FilePath = path,
+            FileType = ArchiveType.DSARC,
+            OriginalFilePath = path,
+            RootEntry = root
+        };
+    }
+    private static ArchiveDocument ParseMsnd(byte[] buf, string path)
+    {
+        if (buf.Length < Formats.MsndHeader || !buf.AsSpan(0, 4).SequenceEqual(Formats.MagicMsnd))
+        {
+            throw new InvalidDataException("Invalid MSND header.");
+        }
+        string baseName = Path.GetFileNameWithoutExtension(path);
+        ArchiveEntry root = new() { Name = Path.GetFileName(path), NestedType = ArchiveType.MSND };
+        MsndOffsets offsets = Formats.ParseMsndOffsets(buf);
+        ValidateMsndBounds(buf.Length, offsets);
+        root.Children.Add(Formats.CreateMsndChildEntry($"{baseName}.sseq", buf, offsets.SseqOffset, offsets.SseqSize));
+        root.Children.Add(Formats.CreateMsndChildEntry($"{baseName}.sbnk", buf, offsets.SbnkOffset, offsets.SbnkSize));
+        root.Children.Add(Formats.CreateMsndChildEntry($"{baseName}.swar", buf, offsets.SwarOffset, offsets.SwarSize));
+        return new ArchiveDocument
+        {
+            FilePath = path,
+            FileType = ArchiveType.MSND,
+            OriginalFilePath = path,
+            RootEntry = root
+        };
+    }
+    private static void ParseMsndChildren(ReadOnlySpan<byte> msndData, ArchiveEntry parent, string parentName)
+    {
+        if (msndData.Length < Formats.MsndHeader)
+        {
+            return;
+        }
+        string baseName = Path.GetFileNameWithoutExtension(parentName);
+        byte[] fullData = msndData.ToArray();
+        MsndOffsets offsets = Formats.ParseMsndOffsets(fullData);
+        if (!Formats.AreMsndBoundsValid(msndData.Length, offsets))
+        {
+            return;
+        }
+        parent.Children.Add(Formats.CreateMsndChildEntry($"{baseName}.sseq", fullData, offsets.SseqOffset, offsets.SseqSize));
+        parent.Children.Add(Formats.CreateMsndChildEntry($"{baseName}.sbnk", fullData, offsets.SbnkOffset, offsets.SbnkSize));
+        parent.Children.Add(Formats.CreateMsndChildEntry($"{baseName}.swar", fullData, offsets.SwarOffset, offsets.SwarSize));
+    }
+    private static void ParseDsarcChildren(ReadOnlySpan<byte> dsarcData, ArchiveEntry parent, string parentName)
+    {
+        try
+        {
+            if (dsarcData.Length < Formats.DsarcHeader || !dsarcData[..8].SequenceEqual(Formats.MagicDsarc))
+            {
+                return;
+            }
+            int count = BitConverter.ToInt32(dsarcData[8..12]);
+            int version = BitConverter.ToInt32(dsarcData[12..16]);
+            if (version != Formats.DsarcVersion)
+            {
+                return;
+            }
+            parent.Children.Clear();
+            byte[] fullData = dsarcData.ToArray();
+            int pos = Formats.DsarcHeader;
+            for (int i = 0; i < count; i++)
+            {
+                ReadOnlySpan<byte> nameBytes = dsarcData[pos..(pos + Formats.NameSize)];
+                string name = Encoding.UTF8.GetString(nameBytes).Split('\0')[0].Trim();
+                if (string.IsNullOrEmpty(name))
+                {
+                    name = $"file_{i}";
+                }
+                pos += Formats.NameSize;
+                int size = BitConverter.ToInt32(dsarcData[pos..(pos + 4)]);
+                int offset = BitConverter.ToInt32(dsarcData[(pos + 4)..(pos + 8)]);
+                pos += Formats.DsarcEntryInfo;
+                if (offset < 0 || size < 0 || offset + size > dsarcData.Length)
+                {
+                    continue;
+                }
+                ArchiveEntry child = new()
+                {
+                    Name = name,
+                    Size = size,
+                    Offset = offset,
+                    ImportOrder = i,
+                    DataSource = new BufferSource(fullData[offset..(offset + size)])
+                };
+                int checkSize = Math.Min(size, 8);
+                ReadOnlySpan<byte> entryData = dsarcData[offset..(offset + checkSize)];
+                if (size >= 4 && entryData[..Math.Min(4, entryData.Length)].SequenceEqual(Formats.MagicMsnd))
+                {
+                    child.NestedType = ArchiveType.MSND;
+                    ParseMsndChildren(dsarcData[offset..(offset + size)], child, name);
+                }
+                else if (size >= 8 && entryData[..Math.Min(8, entryData.Length)].SequenceEqual(Formats.MagicDsarc))
+                {
+                    child.NestedType = ArchiveType.DSARC;
+                    ParseDsarcChildren(dsarcData[offset..(offset + size)], child, name);
+                }
+                parent.Children.Add(child);
+            }
+        }
+        catch { }
+    }
+    private static void ValidateMsndBounds(int length, MsndOffsets offsets)
+    {
+        if (!Formats.AreMsndBoundsValid(length, offsets))
+        {
+            throw new InvalidDataException("MSND chunk exceeds bounds.");
+        }
+    }
+}
+
+//ArchiveWriterService.cs
+using Disgaea_DS_Manager.Models;
+namespace Disgaea_DS_Manager.Services;
+
+public sealed class ArchiveWriterService
+{
+    public async Task<byte[]> SerializeAsync(ArchiveDocument doc, IProgress<double>? progress = null, CancellationToken ct = default)
+    {
+        return doc.FileType switch
+        {
+            ArchiveType.DSARC => await SerializeDsarcAsync(doc, progress, ct).ConfigureAwait(false),
+            ArchiveType.MSND => await SerializeMsndAsync(doc, progress, ct).ConfigureAwait(false),
+            _ => throw new NotSupportedException($"Unsupported archive type: {doc.FileType}")
+        };
+    }
+    public async Task<byte[]> SerializeEntryAsync(ArchiveEntry entry, CancellationToken ct = default)
+    {
+        return !entry.IsNested || entry.Children.Count == 0
+            ? await entry.GetDataAsync(ct).ConfigureAwait(false)
+            : entry.NestedType switch
+            {
+                ArchiveType.MSND => await BuildMsndFromEntryAsync(entry, ct).ConfigureAwait(false),
+                ArchiveType.DSARC => await BuildDsarcFromEntryAsync(entry, ct).ConfigureAwait(false),
+                _ => await entry.GetDataAsync(ct).ConfigureAwait(false)
+            };
+    }
+    private async Task<byte[]> SerializeDsarcAsync(ArchiveDocument doc, IProgress<double>? progress, CancellationToken ct)
+    {
+        List<ArchiveEntry> entries = doc.RootEntry.Children;
+        int count = entries.Count;
+        int headerSize = Formats.DsarcHeader + (count * (Formats.NameSize + Formats.DsarcEntryInfo));
+        List<(string Name, byte[] Data)> dataList = new(count);
+        int totalDataSize = 0;
+        for (int i = 0; i < count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            ArchiveEntry entry = entries[i];
+            byte[] data = await SerializeEntryAsync(entry, ct).ConfigureAwait(false);
+            dataList.Add((entry.Name, data));
+            totalDataSize += data.Length;
+            progress?.Report((double)(i + 1) / (count * 2));
+        }
+        using MemoryStream ms = new(headerSize + totalDataSize);
+        using BinaryWriter bw = new(ms);
+        bw.Write(Formats.MagicDsarc);
+        bw.Write(count);
+        bw.Write(Formats.DsarcVersion);
+        int offset = headerSize;
+        foreach ((string name, byte[] data) in dataList)
+        {
+            bw.Write(Formats.PadName(name));
+            bw.Write(data.Length);
+            bw.Write(offset);
+            offset += data.Length;
+        }
+        for (int i = 0; i < dataList.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            bw.Write(dataList[i].Data);
+            progress?.Report(0.5 + ((double)(i + 1) / (count * 2)));
+            await Task.Yield();
+        }
+        return ms.ToArray();
+    }
+    private async Task<byte[]> SerializeMsndAsync(ArchiveDocument doc, IProgress<double>? progress, CancellationToken ct)
+    {
+        List<ArchiveEntry> children = doc.RootEntry.Children;
+        if (children.Count != 3)
+        {
+            throw new InvalidOperationException("MSND requires exactly 3 chunks (sseq, sbnk, swar).");
+        }
+        Dictionary<string, byte[]> chunks = new(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < 3; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            string ext = Path.GetExtension(children[i].Name).ToLowerInvariant();
+            chunks[ext] = await children[i].GetDataAsync(ct).ConfigureAwait(false);
+            progress?.Report((double)(i + 1) / 3);
+        }
+        return Formats.BuildMsnd(chunks);
+    }
+    private async Task<byte[]> BuildMsndFromEntryAsync(ArchiveEntry entry, CancellationToken ct)
+    {
+        if (entry.Children.Count != 3)
+        {
+            throw new InvalidOperationException("MSND entry requires exactly 3 children.");
+        }
+        Dictionary<string, byte[]> chunks = new(StringComparer.OrdinalIgnoreCase);
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            ct.ThrowIfCancellationRequested();
+            string ext = Path.GetExtension(child.Name).ToLowerInvariant();
+            chunks[ext] = await child.GetDataAsync(ct).ConfigureAwait(false);
+        }
+        byte[]? unknownBytes = await TryExtractUnknownBytesAsync(entry, ct).ConfigureAwait(false);
+        return Formats.BuildMsnd(chunks, unknownBytes);
+    }
+    private static async Task<byte[]?> TryExtractUnknownBytesAsync(ArchiveEntry entry, CancellationToken ct)
+    {
+        if (entry.DataSource is null)
+        {
+            return null;
+        }
+        try
+        {
+            byte[] originalData = await entry.DataSource.GetDataAsync(ct).ConfigureAwait(false);
+            if (originalData.Length >= Formats.MsndHeader && originalData.AsSpan(0, 4).SequenceEqual(Formats.MagicMsnd))
+            {
+                return Formats.ExtractMsndUnknownBytes(originalData);
+            }
+        }
+        catch { }
+        return null;
+    }
+    private async Task<byte[]> BuildDsarcFromEntryAsync(ArchiveEntry entry, CancellationToken ct)
+    {
+        ArchiveDocument tempDoc = new() { FileType = ArchiveType.DSARC, RootEntry = entry };
+        return await SerializeDsarcAsync(tempDoc, null, ct).ConfigureAwait(false);
+    }
+    public byte[] ReplaceChunk(byte[] msndBuf, string ext, byte[] newData)
+    {
+        ArgumentNullException.ThrowIfNull(msndBuf);
+        ArgumentNullException.ThrowIfNull(newData);
+        if (msndBuf.Length < Formats.MsndHeader || !msndBuf.AsSpan(0, 4).SequenceEqual(Formats.MagicMsnd))
+        {
+            throw new InvalidDataException("Invalid MSND buffer.");
+        }
+        MsndOffsets offsets = Formats.ParseMsndOffsets(msndBuf);
+        byte[] unknownBytes = Formats.ExtractMsndUnknownBytes(msndBuf);
+        Dictionary<string, byte[]> chunks = new(StringComparer.OrdinalIgnoreCase)
+        {
+            [".sseq"] = msndBuf[offsets.SseqOffset..(offsets.SseqOffset + offsets.SseqSize)],
+            [".sbnk"] = msndBuf[offsets.SbnkOffset..(offsets.SbnkOffset + offsets.SbnkSize)],
+            [".swar"] = msndBuf[offsets.SwarOffset..(offsets.SwarOffset + offsets.SwarSize)]
+        };
+        string normalizedExt = ext.ToLowerInvariant();
+        if (!normalizedExt.StartsWith('.'))
+        {
+            normalizedExt = "." + normalizedExt;
+        }
+        if (!chunks.ContainsKey(normalizedExt))
+        {
+            throw new ArgumentException($"Invalid chunk extension: {ext}", nameof(ext));
+        }
+        chunks[normalizedExt] = newData;
+        return Formats.BuildMsnd(chunks, unknownBytes);
+    }
+}
+
+//Commands.cs
+using Disgaea_DS_Manager.Models;
+using Disgaea_DS_Manager.Services;
+namespace Disgaea_DS_Manager.Commands;
+
+public interface ICommand
+{
+    Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default);
+}
+public static class EntryFinder
+{
+    public static ArchiveEntry? FindById(ArchiveEntry root, long id)
+    {
+        if (root.Id == id)
+        {
+            return root;
+        }
+        foreach (ArchiveEntry child in root.Children)
+        {
+            ArchiveEntry? found = FindById(child, id);
+            if (found is not null)
+            {
+                return found;
+            }
+        }
+        return null;
+    }
+    public static ArchiveEntry? FindParent(ArchiveEntry root, long childId)
+    {
+        foreach (ArchiveEntry child in root.Children)
+        {
+            if (child.Id == childId)
+            {
+                return root;
+            }
+            ArchiveEntry? found = FindParent(child, childId);
+            if (found is not null)
+            {
+                return found;
+            }
+        }
+        return null;
+    }
+    public static bool RemoveById(ArchiveEntry parent, long id)
+    {
+        for (int i = 0; i < parent.Children.Count; i++)
+        {
+            if (parent.Children[i].Id == id)
+            {
+                parent.Children.RemoveAt(i);
+                return true;
+            }
+            if (RemoveById(parent.Children[i], id))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    public static bool HasDuplicateName(ArchiveEntry parent, string name, long excludeId)
+    {
+        return parent.Children.Any(c => c.Id != excludeId && c.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    }
+    public static void MarkParentsModified(ArchiveEntry root, long childId)
+    {
+        ArchiveEntry? parent = FindParent(root, childId);
+        if (parent is not null && parent != root)
+        {
+            parent.IsModified = true;
+            MarkParentsModified(root, parent.Id);
+        }
+    }
+    public static void ClearModifiedFlags(ArchiveEntry entry)
+    {
+        entry.IsModified = false;
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            ClearModifiedFlags(child);
+        }
+    }
+    public static void PopulateMsndChildrenWithModified(byte[] msndData, ArchiveEntry entry, bool markModified = true, string? replacedExt = null)
+    {
+        string baseName = Path.GetFileNameWithoutExtension(entry.Name);
+        MsndOffsets offsets = Formats.ParseMsndOffsets(msndData);
+        entry.Children.Clear();
+        entry.Children.Add(CreateChild($"{baseName}.sseq", msndData, offsets.SseqOffset, offsets.SseqSize, markModified || replacedExt == ".sseq"));
+        entry.Children.Add(CreateChild($"{baseName}.sbnk", msndData, offsets.SbnkOffset, offsets.SbnkSize, markModified || replacedExt == ".sbnk"));
+        entry.Children.Add(CreateChild($"{baseName}.swar", msndData, offsets.SwarOffset, offsets.SwarSize, markModified || replacedExt == ".swar"));
+    }
+    private static ArchiveEntry CreateChild(string name, byte[] data, int offset, int size, bool modified)
+    {
+        return new()
+        {
+            Name = name,
+            Size = size,
+            Offset = offset,
+            DataSource = new BufferSource(data[offset..(offset + size)]),
+            IsModified = modified
+        };
+    }
+}
+public sealed class LoadArchiveCommand(ArchiveReaderService reader, string path) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument doc = await reader.ParseAsync(path, ct).ConfigureAwait(false);
+        return doc with { HasContent = true };
+    }
+}
+public sealed class ImportFolderCommand(FolderImportService importer, string folderPath) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ImportResult result = await importer.AnalyzeFolderAsync(folderPath, ct).ConfigureAwait(false);
+        return new ArchiveDocument
+        {
+            FileType = result.FileType,
+            IsModified = true,
+            HasContent = true,
+            RootEntry = new ArchiveEntry { Name = Path.GetFileName(folderPath), Children = result.Entries }
+        };
+    }
+}
+public sealed class ReplaceEntryCommand(ArchiveDocument document, long targetId, byte[] newData) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry entry = EntryFinder.FindById(clone.RootEntry, targetId)
+            ?? throw new InvalidOperationException("Entry not found.");
+        ArchiveType? detectedType = Formats.DetectTypeFromBuffer(newData);
+        entry.DataSource = new BufferSource(newData);
+        entry.Size = newData.Length;
+        entry.IsModified = true;
+        if (detectedType == ArchiveType.MSND && newData.Length >= Formats.MsndHeader)
+        {
+            entry.NestedType = ArchiveType.MSND;
+            EntryFinder.PopulateMsndChildrenWithModified(newData, entry);
+        }
+        else if (detectedType == ArchiveType.DSARC)
+        {
+            entry.NestedType = ArchiveType.DSARC;
+        }
+        else if (entry.IsNested && entry.Children.Count > 0)
+        {
+            entry.NestedType = null;
+            entry.Children.Clear();
+        }
+        EntryFinder.MarkParentsModified(clone.RootEntry, targetId);
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class ReplaceChunkCommand(
+    ArchiveDocument document,
+    long parentId,
+    long chunkId,
+    byte[] newChunkData,
+    ArchiveWriterService writer) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry parent = EntryFinder.FindById(clone.RootEntry, parentId)
+            ?? throw new InvalidOperationException("Parent not found.");
+        ArchiveEntry chunk = EntryFinder.FindById(clone.RootEntry, chunkId)
+            ?? throw new InvalidOperationException("Chunk not found.");
+        byte[] msndData = await parent.GetDataAsync(ct).ConfigureAwait(false);
+        if (msndData.Length < Formats.MsndHeader || !msndData.AsSpan(0, 4).SequenceEqual(Formats.MagicMsnd))
+        {
+            throw new InvalidDataException("Invalid MSND buffer.");
+        }
+        string replacedExt = Path.GetExtension(chunk.Name).ToLowerInvariant();
+        byte[] newMsndData = writer.ReplaceChunk(msndData, replacedExt, newChunkData);
+        parent.DataSource = new BufferSource(newMsndData);
+        parent.Size = newMsndData.Length;
+        parent.IsModified = true;
+        EntryFinder.PopulateMsndChildrenWithModified(newMsndData, parent, false, replacedExt);
+        EntryFinder.MarkParentsModified(clone.RootEntry, parentId);
+        return clone with { IsModified = true };
+    }
+}
+public sealed class SaveArchiveCommand(
+    ArchiveWriterService writer,
+    ArchiveDocument document,
+    string path,
+    IProgress<double>? progress = null) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        IProgress<double>? serializeProgress = progress is not null
+            ? new Progress<double>(p => progress.Report(p * 0.5))
+            : null;
+        byte[] data = await writer.SerializeAsync(document, serializeProgress, ct).ConfigureAwait(false);
+        await WriteFileWithProgressAsync(path, data, progress, ct).ConfigureAwait(false);
+        ArchiveDocument clone = document.DeepCopy();
+        EntryFinder.ClearModifiedFlags(clone.RootEntry);
+        return clone with { FilePath = path, OriginalFilePath = path, IsModified = false };
+    }
+    private static async Task WriteFileWithProgressAsync(string path, byte[] data, IProgress<double>? progress, CancellationToken ct)
+    {
+        const int BufferSize = 1024 * 1024;
+        long totalBytes = data.Length;
+        long bytesWritten = 0;
+        using FileStream fileStream = new(path, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
+        while (bytesWritten < totalBytes)
+        {
+            ct.ThrowIfCancellationRequested();
+            int bytesToWrite = (int)Math.Min(BufferSize, totalBytes - bytesWritten);
+            await fileStream.WriteAsync(data, (int)bytesWritten, bytesToWrite, ct).ConfigureAwait(false);
+            bytesWritten += bytesToWrite;
+            double progressValue = 0.5 + ((double)bytesWritten / totalBytes * 0.5);
+            progress?.Report(progressValue);
+        }
+        await fileStream.FlushAsync(ct).ConfigureAwait(false);
+    }
+}
+public sealed class ImportToNestedCommand(
+    ArchiveDocument document,
+    long targetId,
+    string folderPath,
+    FolderImportService importer) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry entry = EntryFinder.FindById(clone.RootEntry, targetId)
+            ?? throw new InvalidOperationException("Entry not found.");
+        byte[]? unknownBytes = await TryGetExistingUnknownBytesAsync(entry, ct).ConfigureAwait(false)
+            ?? await ReadMsndUnknownBytesFromFolderAsync(folderPath, ct).ConfigureAwait(false);
+        ImportResult result = await importer.AnalyzeFolderAsync(folderPath, ct).ConfigureAwait(false);
+        Dictionary<string, byte[]> chunks = new(StringComparer.OrdinalIgnoreCase);
+        foreach (ArchiveEntry child in result.Entries)
+        {
+            string ext = Path.GetExtension(child.Name).ToLowerInvariant();
+            chunks[ext] = await child.GetDataAsync(ct).ConfigureAwait(false);
+        }
+        byte[] newMsndData = Formats.BuildMsnd(chunks, unknownBytes);
+        entry.DataSource = new BufferSource(newMsndData);
+        entry.Size = newMsndData.Length;
+        entry.NestedType = ArchiveType.MSND;
+        entry.IsModified = true;
+        EntryFinder.PopulateMsndChildrenWithModified(newMsndData, entry);
+        EntryFinder.MarkParentsModified(clone.RootEntry, targetId);
+        return clone with { IsModified = true };
+    }
+    private static async Task<byte[]?> TryGetExistingUnknownBytesAsync(ArchiveEntry entry, CancellationToken ct)
+    {
+        if (entry.DataSource is null)
+        {
+            return null;
+        }
+        try
+        {
+            byte[] originalData = await entry.DataSource.GetDataAsync(ct).ConfigureAwait(false);
+            if (originalData.Length >= Formats.MsndHeader && originalData.AsSpan(0, 4).SequenceEqual(Formats.MagicMsnd))
+            {
+                return Formats.ExtractMsndUnknownBytes(originalData);
+            }
+        }
+        catch { }
+        return null;
+    }
+    private static async Task<byte[]?> ReadMsndUnknownBytesFromFolderAsync(string folder, CancellationToken ct)
+    {
+        List<string> txtFiles = Directory.GetFiles(folder, "*.txt", SearchOption.TopDirectoryOnly)
+            .Where(f => !Path.GetFileName(f).Equals("mapper.txt", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (txtFiles.Count == 0)
+        {
+            return null;
+        }
+        byte[] data = await File.ReadAllBytesAsync(txtFiles[0], ct).ConfigureAwait(false);
+        if (data.Length >= 4)
+        {
+            return data[..4];
+        }
+        if (data.Length > 0)
+        {
+            byte[] padded = new byte[4];
+            data.CopyTo(padded, 0);
+            return padded;
+        }
+        return null;
+    }
+}
+public sealed class AddBlankEntryCommand(
+    ArchiveDocument document,
+    long? parentId,
+    string name,
+    bool isContainer,
+    ArchiveType? containerType) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        byte[] entryData = isContainer && containerType == ArchiveType.MSND ? Formats.BuildEmptyMsnd() : [];
+        ArchiveEntry newEntry = new()
+        {
+            Name = name,
+            Size = entryData.Length,
+            IsModified = true,
+            ImportOrder = int.MaxValue,
+            DataSource = new BufferSource(entryData),
+            NestedType = isContainer ? containerType : null
+        };
+        if (isContainer && containerType == ArchiveType.MSND)
+        {
+            string baseName = Path.GetFileNameWithoutExtension(name);
+            int sseqOff = Formats.MsndHeader;
+            newEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.sseq", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+            newEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.sbnk", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+            newEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.swar", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+        }
+        if (parentId is null)
+        {
+            clone.RootEntry.Children.Add(newEntry);
+        }
+        else
+        {
+            ArchiveEntry? targetParent = EntryFinder.FindById(clone.RootEntry, parentId.Value);
+            if (targetParent is not null)
+            {
+                targetParent.Children.Add(newEntry);
+                targetParent.IsModified = true;
+                EntryFinder.MarkParentsModified(clone.RootEntry, parentId.Value);
+            }
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class DeleteEntryCommand(ArchiveDocument document, long targetId) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? parent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        bool removed = EntryFinder.RemoveById(clone.RootEntry, targetId);
+        if (removed && parent is not null && parent != clone.RootEntry)
+        {
+            parent.IsModified = true;
+            EntryFinder.MarkParentsModified(clone.RootEntry, parent.Id);
+        }
+        return Task.FromResult(clone with { IsModified = removed || clone.IsModified });
+    }
+}
+public sealed class SortEntriesCommand(
+    ArchiveDocument document,
+    long? containerId = null,
+    bool sortAlphabetically = true,
+    bool recursive = false) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry container = containerId is null
+            ? clone.RootEntry
+            : EntryFinder.FindById(clone.RootEntry, containerId.Value) ?? clone.RootEntry;
+        if (container.NestedType == ArchiveType.MSND)
+        {
+            return Task.FromResult(clone);
+        }
+        if (recursive)
+        {
+            SortRecursive(container, sortAlphabetically);
+        }
+        else
+        {
+            SortContainer(container, sortAlphabetically);
+        }
+        if (container != clone.RootEntry)
+        {
+            container.IsModified = true;
+            EntryFinder.MarkParentsModified(clone.RootEntry, container.Id);
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+    private static void SortRecursive(ArchiveEntry entry, bool sortAlphabetically)
+    {
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            if (child.NestedType == ArchiveType.DSARC)
+            {
+                SortRecursive(child, sortAlphabetically);
+            }
+        }
+        SortContainer(entry, sortAlphabetically);
+    }
+    private static void SortContainer(ArchiveEntry container, bool sortAlphabetically)
+    {
+        if (container.NestedType == ArchiveType.MSND)
+        {
+            return;
+        }
+        List<ArchiveEntry> sorted = sortAlphabetically
+            ? [.. container.Children.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)]
+            : [.. container.Children.OrderBy(e => e.ImportOrder)];
+        container.Children.Clear();
+        container.Children.AddRange(sorted);
+    }
+}
+public sealed class RenameEntryCommand(ArchiveDocument document, long targetId, string newName) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? entry = EntryFinder.FindById(clone.RootEntry, targetId);
+        if (entry is not null)
+        {
+            string newBaseName = Path.GetFileNameWithoutExtension(newName);
+            entry.Name = newName;
+            entry.IsModified = true;
+            if (entry.NestedType == ArchiveType.MSND && entry.Children.Count == 3)
+            {
+                foreach (ArchiveEntry child in entry.Children)
+                {
+                    string ext = Path.GetExtension(child.Name);
+                    child.Name = $"{newBaseName}{ext}";
+                }
+            }
+            EntryFinder.MarkParentsModified(clone.RootEntry, targetId);
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class MoveEntryCommand(ArchiveDocument document, long targetId, long? destinationParentId, int newIndex) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? sourceParent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        if (sourceParent is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? entryToMove = null;
+        int sourceIndex = -1;
+        for (int i = 0; i < sourceParent.Children.Count; i++)
+        {
+            if (sourceParent.Children[i].Id == targetId)
+            {
+                entryToMove = sourceParent.Children[i];
+                sourceIndex = i;
+                sourceParent.Children.RemoveAt(i);
+                break;
+            }
+        }
+        if (entryToMove is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry destParent = destinationParentId is null
+            ? clone.RootEntry
+            : EntryFinder.FindById(clone.RootEntry, destinationParentId.Value) ?? clone.RootEntry;
+        int insertIndex = newIndex;
+        if (sourceParent.Id == destParent.Id && sourceIndex < newIndex)
+        {
+            insertIndex--;
+        }
+        insertIndex = Math.Clamp(insertIndex, 0, destParent.Children.Count);
+        destParent.Children.Insert(insertIndex, entryToMove);
+        if (sourceParent != clone.RootEntry)
+        {
+            sourceParent.IsModified = true;
+        }
+        if (destParent != clone.RootEntry && destParent != sourceParent)
+        {
+            destParent.IsModified = true;
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class MoveEntryToContainerCommand(ArchiveDocument document, long targetId, long containerId) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? sourceParent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        if (sourceParent is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? entryToMove = null;
+        for (int i = 0; i < sourceParent.Children.Count; i++)
+        {
+            if (sourceParent.Children[i].Id == targetId)
+            {
+                entryToMove = sourceParent.Children[i];
+                sourceParent.Children.RemoveAt(i);
+                break;
+            }
+        }
+        if (entryToMove is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? targetContainer = EntryFinder.FindById(clone.RootEntry, containerId);
+        if (targetContainer?.NestedType == ArchiveType.DSARC)
+        {
+            targetContainer.Children.Add(entryToMove);
+            targetContainer.IsModified = true;
+            if (sourceParent != clone.RootEntry)
+            {
+                sourceParent.IsModified = true;
+            }
+            EntryFinder.MarkParentsModified(clone.RootEntry, containerId);
+        }
+        else
+        {
+            sourceParent.Children.Add(entryToMove);
+            return Task.FromResult(clone);
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class MoveEntryUpCommand(ArchiveDocument document, long targetId) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? sourceParent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        if (sourceParent is null || sourceParent == clone.RootEntry)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? grandParent = EntryFinder.FindParent(clone.RootEntry, sourceParent.Id);
+        if (grandParent is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? entryToMove = null;
+        for (int i = 0; i < sourceParent.Children.Count; i++)
+        {
+            if (sourceParent.Children[i].Id == targetId)
+            {
+                entryToMove = sourceParent.Children[i];
+                sourceParent.Children.RemoveAt(i);
+                break;
+            }
+        }
+        if (entryToMove is null)
+        {
+            return Task.FromResult(clone);
+        }
+        int parentIndex = grandParent.Children.FindIndex(c => c.Id == sourceParent.Id);
+        grandParent.Children.Insert(parentIndex + 1, entryToMove);
+        sourceParent.IsModified = true;
+        if (grandParent != clone.RootEntry)
+        {
+            grandParent.IsModified = true;
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class CommandProcessor
+{
+    private readonly LinkedList<ArchiveDocument> _undoStack = new();
+    private readonly Stack<ArchiveDocument> _redoStack = new();
+    private const int MaxUndoLevels = 50;
+    public ArchiveDocument Current { get; private set; } = new();
+    public bool CanUndo => _undoStack.Count > 0;
+    public bool CanRedo => _redoStack.Count > 0;
+    public async Task<ArchiveDocument> ExecuteAsync(ICommand command, CancellationToken ct = default)
+    {
+        _ = _undoStack.AddFirst(Current.DeepCopy());
+        while (_undoStack.Count > MaxUndoLevels)
+        {
+            _undoStack.RemoveLast();
+        }
+        _redoStack.Clear();
+        Current = await command.ExecuteAsync(ct).ConfigureAwait(false);
+        return Current;
+    }
+    public ArchiveDocument Undo()
+    {
+        if (!CanUndo)
+        {
+            throw new InvalidOperationException("Nothing to undo.");
+        }
+        _redoStack.Push(Current);
+        Current = _undoStack.First!.Value;
+        _undoStack.RemoveFirst();
+        return Current;
+    }
+    public ArchiveDocument Redo()
+    {
+        if (!CanRedo)
+        {
+            throw new InvalidOperationException("Nothing to redo.");
+        }
+        _ = _undoStack.AddFirst(Current);
+        Current = _redoStack.Pop();
+        return Current;
+    }
+    public void SetCurrent(ArchiveDocument doc)
+    {
+        _undoStack.Clear();
+        _redoStack.Clear();
+        Current = doc;
+    }
+    public void Clear()
+    {
+        _undoStack.Clear();
+        _redoStack.Clear();
+        Current = new ArchiveDocument();
+    }
+}
+
+//DialogService.cs
+using Disgaea_DS_Manager.Models;
+using Disgaea_DS_Manager.Services;
+namespace Disgaea_DS_Manager.Commands;
+
+public interface ICommand
+{
+    Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default);
+}
+public static class EntryFinder
+{
+    public static ArchiveEntry? FindById(ArchiveEntry root, long id)
+    {
+        if (root.Id == id)
+        {
+            return root;
+        }
+        foreach (ArchiveEntry child in root.Children)
+        {
+            ArchiveEntry? found = FindById(child, id);
+            if (found is not null)
+            {
+                return found;
+            }
+        }
+        return null;
+    }
+    public static ArchiveEntry? FindParent(ArchiveEntry root, long childId)
+    {
+        foreach (ArchiveEntry child in root.Children)
+        {
+            if (child.Id == childId)
+            {
+                return root;
+            }
+            ArchiveEntry? found = FindParent(child, childId);
+            if (found is not null)
+            {
+                return found;
+            }
+        }
+        return null;
+    }
+    public static bool RemoveById(ArchiveEntry parent, long id)
+    {
+        for (int i = 0; i < parent.Children.Count; i++)
+        {
+            if (parent.Children[i].Id == id)
+            {
+                parent.Children.RemoveAt(i);
+                return true;
+            }
+            if (RemoveById(parent.Children[i], id))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    public static bool HasDuplicateName(ArchiveEntry parent, string name, long excludeId)
+    {
+        return parent.Children.Any(c => c.Id != excludeId && c.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    }
+    public static void MarkParentsModified(ArchiveEntry root, long childId)
+    {
+        ArchiveEntry? parent = FindParent(root, childId);
+        if (parent is not null && parent != root)
+        {
+            parent.IsModified = true;
+            MarkParentsModified(root, parent.Id);
+        }
+    }
+    public static void ClearModifiedFlags(ArchiveEntry entry)
+    {
+        entry.IsModified = false;
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            ClearModifiedFlags(child);
+        }
+    }
+    public static void PopulateMsndChildrenWithModified(byte[] msndData, ArchiveEntry entry, bool markModified = true, string? replacedExt = null)
+    {
+        string baseName = Path.GetFileNameWithoutExtension(entry.Name);
+        MsndOffsets offsets = Formats.ParseMsndOffsets(msndData);
+        entry.Children.Clear();
+        entry.Children.Add(CreateChild($"{baseName}.sseq", msndData, offsets.SseqOffset, offsets.SseqSize, markModified || replacedExt == ".sseq"));
+        entry.Children.Add(CreateChild($"{baseName}.sbnk", msndData, offsets.SbnkOffset, offsets.SbnkSize, markModified || replacedExt == ".sbnk"));
+        entry.Children.Add(CreateChild($"{baseName}.swar", msndData, offsets.SwarOffset, offsets.SwarSize, markModified || replacedExt == ".swar"));
+    }
+    private static ArchiveEntry CreateChild(string name, byte[] data, int offset, int size, bool modified)
+    {
+        return new()
+        {
+            Name = name,
+            Size = size,
+            Offset = offset,
+            DataSource = new BufferSource(data[offset..(offset + size)]),
+            IsModified = modified
+        };
+    }
+}
+public sealed class LoadArchiveCommand(ArchiveReaderService reader, string path) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument doc = await reader.ParseAsync(path, ct).ConfigureAwait(false);
+        return doc with { HasContent = true };
+    }
+}
+public sealed class ImportFolderCommand(FolderImportService importer, string folderPath) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ImportResult result = await importer.AnalyzeFolderAsync(folderPath, ct).ConfigureAwait(false);
+        return new ArchiveDocument
+        {
+            FileType = result.FileType,
+            IsModified = true,
+            HasContent = true,
+            RootEntry = new ArchiveEntry { Name = Path.GetFileName(folderPath), Children = result.Entries }
+        };
+    }
+}
+public sealed class ReplaceEntryCommand(ArchiveDocument document, long targetId, byte[] newData) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry entry = EntryFinder.FindById(clone.RootEntry, targetId)
+            ?? throw new InvalidOperationException("Entry not found.");
+        ArchiveType? detectedType = Formats.DetectTypeFromBuffer(newData);
+        entry.DataSource = new BufferSource(newData);
+        entry.Size = newData.Length;
+        entry.IsModified = true;
+        if (detectedType == ArchiveType.MSND && newData.Length >= Formats.MsndHeader)
+        {
+            entry.NestedType = ArchiveType.MSND;
+            EntryFinder.PopulateMsndChildrenWithModified(newData, entry);
+        }
+        else if (detectedType == ArchiveType.DSARC)
+        {
+            entry.NestedType = ArchiveType.DSARC;
+        }
+        else if (entry.IsNested && entry.Children.Count > 0)
+        {
+            entry.NestedType = null;
+            entry.Children.Clear();
+        }
+        EntryFinder.MarkParentsModified(clone.RootEntry, targetId);
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class ReplaceChunkCommand(
+    ArchiveDocument document,
+    long parentId,
+    long chunkId,
+    byte[] newChunkData,
+    ArchiveWriterService writer) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry parent = EntryFinder.FindById(clone.RootEntry, parentId)
+            ?? throw new InvalidOperationException("Parent not found.");
+        ArchiveEntry chunk = EntryFinder.FindById(clone.RootEntry, chunkId)
+            ?? throw new InvalidOperationException("Chunk not found.");
+        byte[] msndData = await parent.GetDataAsync(ct).ConfigureAwait(false);
+        if (msndData.Length < Formats.MsndHeader || !msndData.AsSpan(0, 4).SequenceEqual(Formats.MagicMsnd))
+        {
+            throw new InvalidDataException("Invalid MSND buffer.");
+        }
+        string replacedExt = Path.GetExtension(chunk.Name).ToLowerInvariant();
+        byte[] newMsndData = writer.ReplaceChunk(msndData, replacedExt, newChunkData);
+        parent.DataSource = new BufferSource(newMsndData);
+        parent.Size = newMsndData.Length;
+        parent.IsModified = true;
+        EntryFinder.PopulateMsndChildrenWithModified(newMsndData, parent, false, replacedExt);
+        EntryFinder.MarkParentsModified(clone.RootEntry, parentId);
+        return clone with { IsModified = true };
+    }
+}
+public sealed class SaveArchiveCommand(
+    ArchiveWriterService writer,
+    ArchiveDocument document,
+    string path,
+    IProgress<double>? progress = null) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        IProgress<double>? serializeProgress = progress is not null
+            ? new Progress<double>(p => progress.Report(p * 0.5))
+            : null;
+        byte[] data = await writer.SerializeAsync(document, serializeProgress, ct).ConfigureAwait(false);
+        await WriteFileWithProgressAsync(path, data, progress, ct).ConfigureAwait(false);
+        ArchiveDocument clone = document.DeepCopy();
+        EntryFinder.ClearModifiedFlags(clone.RootEntry);
+        return clone with { FilePath = path, OriginalFilePath = path, IsModified = false };
+    }
+    private static async Task WriteFileWithProgressAsync(string path, byte[] data, IProgress<double>? progress, CancellationToken ct)
+    {
+        const int BufferSize = 1024 * 1024;
+        long totalBytes = data.Length;
+        long bytesWritten = 0;
+        using FileStream fileStream = new(path, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, useAsync: true);
+        while (bytesWritten < totalBytes)
+        {
+            ct.ThrowIfCancellationRequested();
+            int bytesToWrite = (int)Math.Min(BufferSize, totalBytes - bytesWritten);
+            await fileStream.WriteAsync(data, (int)bytesWritten, bytesToWrite, ct).ConfigureAwait(false);
+            bytesWritten += bytesToWrite;
+            double progressValue = 0.5 + ((double)bytesWritten / totalBytes * 0.5);
+            progress?.Report(progressValue);
+        }
+        await fileStream.FlushAsync(ct).ConfigureAwait(false);
+    }
+}
+public sealed class ImportToNestedCommand(
+    ArchiveDocument document,
+    long targetId,
+    string folderPath,
+    FolderImportService importer) : ICommand
+{
+    public async Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry entry = EntryFinder.FindById(clone.RootEntry, targetId)
+            ?? throw new InvalidOperationException("Entry not found.");
+        byte[]? unknownBytes = await TryGetExistingUnknownBytesAsync(entry, ct).ConfigureAwait(false)
+            ?? await ReadMsndUnknownBytesFromFolderAsync(folderPath, ct).ConfigureAwait(false);
+        ImportResult result = await importer.AnalyzeFolderAsync(folderPath, ct).ConfigureAwait(false);
+        Dictionary<string, byte[]> chunks = new(StringComparer.OrdinalIgnoreCase);
+        foreach (ArchiveEntry child in result.Entries)
+        {
+            string ext = Path.GetExtension(child.Name).ToLowerInvariant();
+            chunks[ext] = await child.GetDataAsync(ct).ConfigureAwait(false);
+        }
+        byte[] newMsndData = Formats.BuildMsnd(chunks, unknownBytes);
+        entry.DataSource = new BufferSource(newMsndData);
+        entry.Size = newMsndData.Length;
+        entry.NestedType = ArchiveType.MSND;
+        entry.IsModified = true;
+        EntryFinder.PopulateMsndChildrenWithModified(newMsndData, entry);
+        EntryFinder.MarkParentsModified(clone.RootEntry, targetId);
+        return clone with { IsModified = true };
+    }
+    private static async Task<byte[]?> TryGetExistingUnknownBytesAsync(ArchiveEntry entry, CancellationToken ct)
+    {
+        if (entry.DataSource is null)
+        {
+            return null;
+        }
+        try
+        {
+            byte[] originalData = await entry.DataSource.GetDataAsync(ct).ConfigureAwait(false);
+            if (originalData.Length >= Formats.MsndHeader && originalData.AsSpan(0, 4).SequenceEqual(Formats.MagicMsnd))
+            {
+                return Formats.ExtractMsndUnknownBytes(originalData);
+            }
+        }
+        catch { }
+        return null;
+    }
+    private static async Task<byte[]?> ReadMsndUnknownBytesFromFolderAsync(string folder, CancellationToken ct)
+    {
+        List<string> txtFiles = Directory.GetFiles(folder, "*.txt", SearchOption.TopDirectoryOnly)
+            .Where(f => !Path.GetFileName(f).Equals("mapper.txt", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (txtFiles.Count == 0)
+        {
+            return null;
+        }
+        byte[] data = await File.ReadAllBytesAsync(txtFiles[0], ct).ConfigureAwait(false);
+        if (data.Length >= 4)
+        {
+            return data[..4];
+        }
+        if (data.Length > 0)
+        {
+            byte[] padded = new byte[4];
+            data.CopyTo(padded, 0);
+            return padded;
+        }
+        return null;
+    }
+}
+public sealed class AddBlankEntryCommand(
+    ArchiveDocument document,
+    long? parentId,
+    string name,
+    bool isContainer,
+    ArchiveType? containerType) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        byte[] entryData = isContainer && containerType == ArchiveType.MSND ? Formats.BuildEmptyMsnd() : [];
+        ArchiveEntry newEntry = new()
+        {
+            Name = name,
+            Size = entryData.Length,
+            IsModified = true,
+            ImportOrder = int.MaxValue,
+            DataSource = new BufferSource(entryData),
+            NestedType = isContainer ? containerType : null
+        };
+        if (isContainer && containerType == ArchiveType.MSND)
+        {
+            string baseName = Path.GetFileNameWithoutExtension(name);
+            int sseqOff = Formats.MsndHeader;
+            newEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.sseq", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+            newEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.sbnk", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+            newEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.swar", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+        }
+        if (parentId is null)
+        {
+            clone.RootEntry.Children.Add(newEntry);
+        }
+        else
+        {
+            ArchiveEntry? targetParent = EntryFinder.FindById(clone.RootEntry, parentId.Value);
+            if (targetParent is not null)
+            {
+                targetParent.Children.Add(newEntry);
+                targetParent.IsModified = true;
+                EntryFinder.MarkParentsModified(clone.RootEntry, parentId.Value);
+            }
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class DeleteEntryCommand(ArchiveDocument document, long targetId) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? parent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        bool removed = EntryFinder.RemoveById(clone.RootEntry, targetId);
+        if (removed && parent is not null && parent != clone.RootEntry)
+        {
+            parent.IsModified = true;
+            EntryFinder.MarkParentsModified(clone.RootEntry, parent.Id);
+        }
+        return Task.FromResult(clone with { IsModified = removed || clone.IsModified });
+    }
+}
+public sealed class SortEntriesCommand(
+    ArchiveDocument document,
+    long? containerId = null,
+    bool sortAlphabetically = true,
+    bool recursive = false) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry container = containerId is null
+            ? clone.RootEntry
+            : EntryFinder.FindById(clone.RootEntry, containerId.Value) ?? clone.RootEntry;
+        if (container.NestedType == ArchiveType.MSND)
+        {
+            return Task.FromResult(clone);
+        }
+        if (recursive)
+        {
+            SortRecursive(container, sortAlphabetically);
+        }
+        else
+        {
+            SortContainer(container, sortAlphabetically);
+        }
+        if (container != clone.RootEntry)
+        {
+            container.IsModified = true;
+            EntryFinder.MarkParentsModified(clone.RootEntry, container.Id);
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+    private static void SortRecursive(ArchiveEntry entry, bool sortAlphabetically)
+    {
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            if (child.NestedType == ArchiveType.DSARC)
+            {
+                SortRecursive(child, sortAlphabetically);
+            }
+        }
+        SortContainer(entry, sortAlphabetically);
+    }
+    private static void SortContainer(ArchiveEntry container, bool sortAlphabetically)
+    {
+        if (container.NestedType == ArchiveType.MSND)
+        {
+            return;
+        }
+        List<ArchiveEntry> sorted = sortAlphabetically
+            ? [.. container.Children.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)]
+            : [.. container.Children.OrderBy(e => e.ImportOrder)];
+        container.Children.Clear();
+        container.Children.AddRange(sorted);
+    }
+}
+public sealed class RenameEntryCommand(ArchiveDocument document, long targetId, string newName) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? entry = EntryFinder.FindById(clone.RootEntry, targetId);
+        if (entry is not null)
+        {
+            string newBaseName = Path.GetFileNameWithoutExtension(newName);
+            entry.Name = newName;
+            entry.IsModified = true;
+            if (entry.NestedType == ArchiveType.MSND && entry.Children.Count == 3)
+            {
+                foreach (ArchiveEntry child in entry.Children)
+                {
+                    string ext = Path.GetExtension(child.Name);
+                    child.Name = $"{newBaseName}{ext}";
+                }
+            }
+            EntryFinder.MarkParentsModified(clone.RootEntry, targetId);
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class MoveEntryCommand(ArchiveDocument document, long targetId, long? destinationParentId, int newIndex) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? sourceParent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        if (sourceParent is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? entryToMove = null;
+        int sourceIndex = -1;
+        for (int i = 0; i < sourceParent.Children.Count; i++)
+        {
+            if (sourceParent.Children[i].Id == targetId)
+            {
+                entryToMove = sourceParent.Children[i];
+                sourceIndex = i;
+                sourceParent.Children.RemoveAt(i);
+                break;
+            }
+        }
+        if (entryToMove is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry destParent = destinationParentId is null
+            ? clone.RootEntry
+            : EntryFinder.FindById(clone.RootEntry, destinationParentId.Value) ?? clone.RootEntry;
+        int insertIndex = newIndex;
+        if (sourceParent.Id == destParent.Id && sourceIndex < newIndex)
+        {
+            insertIndex--;
+        }
+        insertIndex = Math.Clamp(insertIndex, 0, destParent.Children.Count);
+        destParent.Children.Insert(insertIndex, entryToMove);
+        if (sourceParent != clone.RootEntry)
+        {
+            sourceParent.IsModified = true;
+        }
+        if (destParent != clone.RootEntry && destParent != sourceParent)
+        {
+            destParent.IsModified = true;
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class MoveEntryToContainerCommand(ArchiveDocument document, long targetId, long containerId) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? sourceParent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        if (sourceParent is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? entryToMove = null;
+        for (int i = 0; i < sourceParent.Children.Count; i++)
+        {
+            if (sourceParent.Children[i].Id == targetId)
+            {
+                entryToMove = sourceParent.Children[i];
+                sourceParent.Children.RemoveAt(i);
+                break;
+            }
+        }
+        if (entryToMove is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? targetContainer = EntryFinder.FindById(clone.RootEntry, containerId);
+        if (targetContainer?.NestedType == ArchiveType.DSARC)
+        {
+            targetContainer.Children.Add(entryToMove);
+            targetContainer.IsModified = true;
+            if (sourceParent != clone.RootEntry)
+            {
+                sourceParent.IsModified = true;
+            }
+            EntryFinder.MarkParentsModified(clone.RootEntry, containerId);
+        }
+        else
+        {
+            sourceParent.Children.Add(entryToMove);
+            return Task.FromResult(clone);
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class MoveEntryUpCommand(ArchiveDocument document, long targetId) : ICommand
+{
+    public Task<ArchiveDocument> ExecuteAsync(CancellationToken ct = default)
+    {
+        ArchiveDocument clone = document.DeepCopy();
+        ArchiveEntry? sourceParent = EntryFinder.FindParent(clone.RootEntry, targetId);
+        if (sourceParent is null || sourceParent == clone.RootEntry)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? grandParent = EntryFinder.FindParent(clone.RootEntry, sourceParent.Id);
+        if (grandParent is null)
+        {
+            return Task.FromResult(clone);
+        }
+        ArchiveEntry? entryToMove = null;
+        for (int i = 0; i < sourceParent.Children.Count; i++)
+        {
+            if (sourceParent.Children[i].Id == targetId)
+            {
+                entryToMove = sourceParent.Children[i];
+                sourceParent.Children.RemoveAt(i);
+                break;
+            }
+        }
+        if (entryToMove is null)
+        {
+            return Task.FromResult(clone);
+        }
+        int parentIndex = grandParent.Children.FindIndex(c => c.Id == sourceParent.Id);
+        grandParent.Children.Insert(parentIndex + 1, entryToMove);
+        sourceParent.IsModified = true;
+        if (grandParent != clone.RootEntry)
+        {
+            grandParent.IsModified = true;
+        }
+        return Task.FromResult(clone with { IsModified = true });
+    }
+}
+public sealed class CommandProcessor
+{
+    private readonly LinkedList<ArchiveDocument> _undoStack = new();
+    private readonly Stack<ArchiveDocument> _redoStack = new();
+    private const int MaxUndoLevels = 50;
+    public ArchiveDocument Current { get; private set; } = new();
+    public bool CanUndo => _undoStack.Count > 0;
+    public bool CanRedo => _redoStack.Count > 0;
+    public async Task<ArchiveDocument> ExecuteAsync(ICommand command, CancellationToken ct = default)
+    {
+        _ = _undoStack.AddFirst(Current.DeepCopy());
+        while (_undoStack.Count > MaxUndoLevels)
+        {
+            _undoStack.RemoveLast();
+        }
+        _redoStack.Clear();
+        Current = await command.ExecuteAsync(ct).ConfigureAwait(false);
+        return Current;
+    }
+    public ArchiveDocument Undo()
+    {
+        if (!CanUndo)
+        {
+            throw new InvalidOperationException("Nothing to undo.");
+        }
+        _redoStack.Push(Current);
+        Current = _undoStack.First!.Value;
+        _undoStack.RemoveFirst();
+        return Current;
+    }
+    public ArchiveDocument Redo()
+    {
+        if (!CanRedo)
+        {
+            throw new InvalidOperationException("Nothing to redo.");
+        }
+        _ = _undoStack.AddFirst(Current);
+        Current = _redoStack.Pop();
+        return Current;
+    }
+    public void SetCurrent(ArchiveDocument doc)
+    {
+        _undoStack.Clear();
+        _redoStack.Clear();
+        Current = doc;
+    }
+    public void Clear()
+    {
+        _undoStack.Clear();
+        _redoStack.Clear();
+        Current = new ArchiveDocument();
+    }
+}
+
+//Disgaea-DS-Manager.csproj
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <AssemblyVersion>1.1.1</AssemblyVersion>
+    <FileVersion>1.1.1.0</FileVersion>
+    <Version>1.1.1</Version>
+    <Company>LandonAndEmma</Company>
+    <Product>Disgaea DS Manager</Product>
+    <Description>Edit DSARC and MSND archives by Nippon Ichi Software</Description>
+    <AssemblyTitle>Disgaea DS Manager</AssemblyTitle>
+    <Copyright>2025</Copyright>
+    <NeutralLanguage>en-US</NeutralLanguage>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>link</TrimMode>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Optimize>true</Optimize>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <EventSourceSupport>false</EventSourceSupport>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <IlcOptimizationPreference>Size</IlcOptimizationPreference>
+    <IlcGenerateDgmlFile>false</IlcGenerateDgmlFile>
+    <IlcGenerateMapFile>false</IlcGenerateMapFile>
+    <StripSymbols>true</StripSymbols>
+    <StartupObject>Disgaea_DS_Manager.Program</StartupObject>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(OS)' == 'Windows_NT'">
+    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <AvaloniaResource Include="Assets\**" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.10" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.10">
+      <TreatAsUsed>true</TreatAsUsed>
+    </PackageReference>
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.10" />
+  </ItemGroup>
+  <ItemGroup>
+    <TrimmerRootAssembly Include="Avalonia.Themes.Fluent" />
+    <TrimmerRootAssembly Include="Disgaea-DS-Manager" />
+  </ItemGroup>
+</Project>
+
+//Disgaea-DS-Manager.slnx
+<Solution>
+  <Project Path="Disgaea-DS-Manager.csproj" />
+</Solution>
+
+//DocumentManager.cs
+using Disgaea_DS_Manager.Commands;
+using Disgaea_DS_Manager.Models;
+namespace Disgaea_DS_Manager.Services;
+
+public sealed class DocumentManager
+{
+    private readonly ArchiveReaderService _reader = new();
+    private readonly ArchiveWriterService _writer = new();
+    private readonly FolderImportService _importer = new();
+    private readonly ExtractionService _extractor = new();
+    private readonly CommandProcessor _processor = new();
+    public ArchiveDocument Current => _processor.Current;
+    public bool CanUndo => _processor.CanUndo;
+    public bool CanRedo => _processor.CanRedo;
+    public event Action? DocumentChanged;
+    public async Task<ArchiveDocument> LoadArchiveAsync(string path, CancellationToken ct = default)
+    {
+        LoadArchiveCommand command = new(_reader, path);
+        ArchiveDocument doc = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public async Task<ArchiveDocument> ImportFolderAsync(string folderPath, CancellationToken ct = default)
+    {
+        ImportFolderCommand command = new(_importer, folderPath);
+        ArchiveDocument doc = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public async Task<ArchiveDocument> ReplaceEntryAsync(ArchiveEntry target, byte[] newData, CancellationToken ct = default)
+    {
+        ReplaceEntryCommand command = new(Current, target.Id, newData);
+        ArchiveDocument doc = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public async Task<ArchiveDocument> ReplaceChunkAsync(ArchiveEntry parentEntry, ArchiveEntry chunkEntry, byte[] newChunkData, CancellationToken ct = default)
+    {
+        ReplaceChunkCommand command = new(Current, parentEntry.Id, chunkEntry.Id, newChunkData, _writer);
+        ArchiveDocument doc = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public async Task<ArchiveDocument> ImportToNestedAsync(ArchiveEntry target, string folderPath, CancellationToken ct = default)
+    {
+        ImportToNestedCommand command = new(Current, target.Id, folderPath, _importer);
+        ArchiveDocument doc = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public async Task<ArchiveDocument> SaveArchiveAsync(string? path = null, IProgress<double>? progress = null, CancellationToken ct = default)
+    {
+        path ??= Current.FilePath ?? throw new InvalidOperationException("No save path specified.");
+        SaveArchiveCommand command = new(_writer, Current, path, progress);
+        ArchiveDocument doc = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public async Task ExtractAllAsync(string destFolder, bool nested, IProgress<(int Current, int Total)>? progress = null, CancellationToken ct = default)
+    {
+        await _extractor.ExtractAllAsync(Current, destFolder, nested, progress, ct).ConfigureAwait(false);
+    }
+    public async Task ExtractSingleAsync(ArchiveEntry entry, string destFolder, CancellationToken ct = default)
+    {
+        await _extractor.ExtractSingleAsync(entry, destFolder, ct).ConfigureAwait(false);
+    }
+    public async Task ExtractNestedAsync(ArchiveEntry entry, string destFolder, IProgress<(int Current, int Total)>? progress = null, CancellationToken ct = default)
+    {
+        await _extractor.ExtractNestedAsync(entry, destFolder, progress, ct).ConfigureAwait(false);
+    }
+    public ArchiveDocument CreateNew(string path)
+    {
+        ArchiveType type = path.EndsWith(".msnd", StringComparison.OrdinalIgnoreCase) ? ArchiveType.MSND : ArchiveType.DSARC;
+        ArchiveDocument doc = new()
+        {
+            FilePath = path,
+            FileType = type,
+            IsModified = true,
+            HasContent = true,
+            RootEntry = new ArchiveEntry { Name = Path.GetFileName(path) }
+        };
+        _processor.SetCurrent(doc);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public ArchiveDocument CreateNewEmpty(ArchiveType type)
+    {
+        string displayName = type == ArchiveType.DSARC ? "New DSARC" : "New DSEQ";
+        ArchiveEntry rootEntry = new() { Name = displayName };
+        if (type == ArchiveType.MSND)
+        {
+            rootEntry.NestedType = ArchiveType.MSND;
+            string baseName = "new_sound";
+            byte[] emptyMsnd = Formats.BuildEmptyMsnd();
+            rootEntry.DataSource = new BufferSource(emptyMsnd);
+            rootEntry.Size = emptyMsnd.Length;
+            int sseqOff = Formats.MsndHeader;
+            rootEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.sseq", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+            rootEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.sbnk", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+            rootEntry.Children.Add(new ArchiveEntry { Name = $"{baseName}.swar", Size = 0, Offset = sseqOff, DataSource = new BufferSource([]), IsModified = true });
+        }
+        ArchiveDocument doc = new()
+        {
+            FilePath = null,
+            FileType = type,
+            IsModified = type == ArchiveType.MSND,
+            HasContent = true,
+            RootEntry = rootEntry
+        };
+        _processor.SetCurrent(doc);
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public async Task AddBlankEntryAsync(ArchiveEntry? parent, string name, bool isContainer, ArchiveType? containerType, CancellationToken ct = default)
+    {
+        AddBlankEntryCommand command = new(Current, parent?.Id, name, isContainer, containerType);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public async Task DeleteEntryAsync(ArchiveEntry target, CancellationToken ct = default)
+    {
+        DeleteEntryCommand command = new(Current, target.Id);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public async Task SortAlphabeticallyAsync(ArchiveEntry? container = null, CancellationToken ct = default)
+    {
+        if (container?.NestedType == ArchiveType.MSND)
+        {
+            return;
+        }
+        SortEntriesCommand command = new(Current, container?.Id, sortAlphabetically: true);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public async Task SortAlphabeticallyRecursiveAsync(ArchiveEntry? container = null, CancellationToken ct = default)
+    {
+        if (container?.NestedType == ArchiveType.MSND)
+        {
+            return;
+        }
+        SortEntriesCommand command = new(Current, container?.Id, sortAlphabetically: true, recursive: true);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public async Task SortByImportOrderAsync(ArchiveEntry? container = null, CancellationToken ct = default)
+    {
+        if (container?.NestedType == ArchiveType.MSND)
+        {
+            return;
+        }
+        SortEntriesCommand command = new(Current, container?.Id, sortAlphabetically: false);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public bool IsRootEmpty()
+    {
+        return Current.FileType == ArchiveType.DSARC
+            ? Current.RootEntry.Children.Count == 0
+            : Current.FileType == ArchiveType.MSND && Current.RootEntry.Children.All(c => c.Size == 0);
+    }
+    public bool CanSortContainer(ArchiveEntry? container)
+    {
+        return container is null
+            ? Current.FileType == ArchiveType.DSARC && Current.RootEntry.Children.Count > 1
+            : container.NestedType == ArchiveType.DSARC && container.Children.Count > 1;
+    }
+    public bool HasNestedArchives()
+    {
+        return Current.FileType == ArchiveType.DSARC &&
+               Current.RootEntry.Children.Any(c => c.NestedType == ArchiveType.DSARC && c.Children.Count > 0);
+    }
+    public bool HasBlankFiles()
+    {
+        return HasBlankEntries(Current.RootEntry);
+    }
+    // <summary>
+    // Checks if an entry or any of its descendants contain blank/empty content.
+    // </summary>
+    private static bool HasBlankEntries(ArchiveEntry entry)
+    {
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            if (IsFullyEmpty(child))
+            {
+                return true;
+            }
+            if (child.NestedType == ArchiveType.DSARC && HasBlankEntries(child))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    // <summary>
+    // Determines if an entry is "fully empty" - meaning it has no meaningful content.
+    // For containers, this means all descendants are also fully empty.
+    // </summary>
+    private static bool IsFullyEmpty(ArchiveEntry entry)
+    {
+        return entry.NestedType == ArchiveType.MSND
+            ? entry.Children.Count == 0 || entry.Children.All(c => c.Size == 0)
+            : entry.NestedType == ArchiveType.DSARC ? entry.Children.Count == 0 || entry.Children.All(IsFullyEmpty) : entry.Size == 0;
+    }
+    // <summary>
+    // Removes all empty entries from the archive.
+    // Prioritizes deleting containers that are fully empty (all descendants empty)
+    // before deleting individual empty files. This is more efficient and matches
+    // user expectations - if a whole folder is empty, delete the folder.
+    // </summary>
+    public async Task RemoveAllEmptyEntriesAsync(CancellationToken ct = default)
+    {
+        bool changed = true;
+        while (changed)
+        {
+            ct.ThrowIfCancellationRequested();
+            changed = false;
+            ArchiveEntry? toDelete = FindBestDeletionTarget(Current.RootEntry);
+            if (toDelete is not null)
+            {
+                await DeleteEntryAsync(toDelete, ct).ConfigureAwait(false);
+                changed = true;
+            }
+        }
+    }
+    // <summary>
+    // Finds the best entry to delete next. Prioritizes:
+    // 1. Fully empty containers (delete whole container instead of individual children)
+    // 2. Individual empty files in containers that have mixed content
+    // </summary>
+    private static ArchiveEntry? FindBestDeletionTarget(ArchiveEntry root)
+    {
+        foreach (ArchiveEntry child in root.Children)
+        {
+            if (IsFullyEmpty(child))
+            {
+                return child;
+            }
+            if (child.NestedType == ArchiveType.DSARC)
+            {
+                ArchiveEntry? nested = FindBestDeletionTarget(child);
+                if (nested is not null)
+                {
+                    return nested;
+                }
+            }
+        }
+        return null;
+    }
+    public async Task RemoveBlankEntriesRecursiveAsync(CancellationToken ct = default)
+    {
+        await RemoveAllEmptyEntriesAsync(ct).ConfigureAwait(false);
+    }
+    public async Task RemoveEmptyDsarcEntriesAsync(CancellationToken ct = default)
+    {
+        await Task.CompletedTask;
+    }
+    public async Task RenameEntryAsync(ArchiveEntry target, string newName, CancellationToken ct = default)
+    {
+        RenameEntryCommand command = new(Current, target.Id, newName);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public async Task MoveEntryAsync(ArchiveEntry entry, long? destinationParentId, int newIndex, CancellationToken ct = default)
+    {
+        if (Current.FileType == ArchiveType.MSND)
+        {
+            return;
+        }
+        MoveEntryCommand command = new(Current, entry.Id, destinationParentId, newIndex);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public async Task MoveEntryToContainerAsync(ArchiveEntry entry, ArchiveEntry targetContainer, CancellationToken ct = default)
+    {
+        if (targetContainer.NestedType != ArchiveType.DSARC)
+        {
+            return;
+        }
+        MoveEntryToContainerCommand command = new(Current, entry.Id, targetContainer.Id);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public async Task MoveEntryUpAsync(ArchiveEntry entry, CancellationToken ct = default)
+    {
+        if (Current.FileType == ArchiveType.MSND)
+        {
+            return;
+        }
+        MoveEntryUpCommand command = new(Current, entry.Id);
+        _ = await _processor.ExecuteAsync(command, ct).ConfigureAwait(false);
+        DocumentChanged?.Invoke();
+    }
+    public bool HasDuplicateName(ArchiveEntry entry, string newName)
+    {
+        ArchiveEntry? parent = EntryFinder.FindParent(Current.RootEntry, entry.Id);
+        return parent is not null && parent.Children.Any(c => c.Id != entry.Id && c.Name.Equals(newName, StringComparison.OrdinalIgnoreCase));
+    }
+    public List<ArchiveEntry> GetEmptyDsarcEntries()
+    {
+        List<ArchiveEntry> emptyEntries = [];
+        FindEmptyContainers(Current.RootEntry, emptyEntries);
+        return emptyEntries;
+    }
+    private static void FindEmptyContainers(ArchiveEntry entry, List<ArchiveEntry> results)
+    {
+        foreach (ArchiveEntry child in entry.Children)
+        {
+            if (IsFullyEmpty(child))
+            {
+                results.Add(child);
+            }
+            else if (child.NestedType == ArchiveType.DSARC)
+            {
+                FindEmptyContainers(child, results);
+            }
+        }
+    }
+    public ArchiveDocument Undo()
+    {
+        ArchiveDocument doc = _processor.Undo();
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public ArchiveDocument Redo()
+    {
+        ArchiveDocument doc = _processor.Redo();
+        DocumentChanged?.Invoke();
+        return doc;
+    }
+    public void Clear()
+    {
+        _processor.Clear();
+        DocumentChanged?.Invoke();
+    }
+}
+
+//ExtractionService.cs
+using Disgaea_DS_Manager.Models;
+using System.Text;
+namespace Disgaea_DS_Manager.Services;
+
+public sealed class ExtractionService
+{
+    private readonly ArchiveWriterService _writer = new();
+    public async Task ExtractAllAsync(
+        ArchiveDocument doc,
+        string destFolder,
+        bool nested,
+        IProgress<(int Current, int Total)>? progress = null,
+        CancellationToken ct = default)
+    {
+        string baseOut = Path.Combine(destFolder, Path.GetFileNameWithoutExtension(doc.FilePath ?? "archive"));
+        _ = Directory.CreateDirectory(baseOut);
+        List<ArchiveEntry> entries = doc.RootEntry.Children;
+        if (doc.FileType == ArchiveType.MSND)
+        {
+            await ExtractMsndDocumentAsync(doc, baseOut, entries, progress, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            await ExtractDsarcDocumentAsync(baseOut, entries, nested, progress, ct).ConfigureAwait(false);
+        }
+    }
+    private async Task ExtractMsndDocumentAsync(
+        ArchiveDocument doc,
+        string baseOut,
+        List<ArchiveEntry> entries,
+        IProgress<(int Current, int Total)>? progress,
+        CancellationToken ct)
+    {
+        string baseName = Path.GetFileNameWithoutExtension(doc.FilePath ?? "archive");
+        byte[] msndData = await _writer.SerializeAsync(doc, null, ct).ConfigureAwait(false);
+        byte[] unknownBytes = Formats.ExtractMsndUnknownBytes(msndData);
+        for (int i = 0; i < entries.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            ArchiveEntry entry = entries[i];
+            byte[] data = await entry.GetDataAsync(ct).ConfigureAwait(false);
+            await File.WriteAllBytesAsync(Path.Combine(baseOut, entry.Name), data, ct).ConfigureAwait(false);
+            progress?.Report((i + 1, entries.Count));
+        }
+        await File.WriteAllBytesAsync(Path.Combine(baseOut, $"{baseName}.txt"), unknownBytes, ct).ConfigureAwait(false);
+    }
+    private async Task ExtractDsarcDocumentAsync(
+        string baseOut,
+        List<ArchiveEntry> entries,
+        bool nested,
+        IProgress<(int Current, int Total)>? progress,
+        CancellationToken ct)
+    {
+        List<string> mapperLines = new(entries.Count);
+        Dictionary<(string, string), int> counters = [];
+        for (int i = 0; i < entries.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            ArchiveEntry entry = entries[i];
+            string outputName = await ExtractEntryAsync(entry, baseOut, nested, counters, ct).ConfigureAwait(false);
+            mapperLines.Add($"{entry.Name}={outputName}");
+            progress?.Report((i + 1, entries.Count));
+        }
+        await File.WriteAllLinesAsync(Path.Combine(baseOut, "mapper.txt"), mapperLines, Encoding.UTF8, ct).ConfigureAwait(false);
+    }
+    public async Task ExtractSingleAsync(ArchiveEntry entry, string destFolder, CancellationToken ct = default)
+    {
+        _ = Directory.CreateDirectory(destFolder);
+        byte[] data = await entry.GetDataAsync(ct).ConfigureAwait(false);
+        string ext = Formats.GuessExtension(data, Path.GetExtension(entry.Name));
+        string fileName = Path.GetFileNameWithoutExtension(entry.Name) + ext;
+        await File.WriteAllBytesAsync(Path.Combine(destFolder, fileName), data, ct).ConfigureAwait(false);
+    }
+    public async Task ExtractNestedAsync(
+        ArchiveEntry entry,
+        string destFolder,
+        IProgress<(int Current, int Total)>? progress = null,
+        CancellationToken ct = default)
+    {
+        string baseOut = Path.Combine(destFolder, Path.GetFileNameWithoutExtension(entry.Name));
+        _ = Directory.CreateDirectory(baseOut);
+        byte[] data = await _writer.SerializeEntryAsync(entry, ct).ConfigureAwait(false);
+        List<ArchiveEntry> children = entry.Children.Count > 0 ? entry.Children : ParseChildren(data, entry.Name);
+        List<string> mapperLines = new(children.Count);
+        Dictionary<(string, string), int> counters = [];
+        for (int i = 0; i < children.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            ArchiveEntry child = children[i];
+            byte[] childData = data[child.Offset..(child.Offset + child.Size)];
+            string outputName = await ExtractChildDataAsync(child.Name, childData, baseOut, counters, ct).ConfigureAwait(false);
+            mapperLines.Add($"{child.Name}={outputName}");
+            progress?.Report((i + 1, children.Count));
+        }
+        if (entry.NestedType == ArchiveType.MSND)
+        {
+            string baseName = Path.GetFileNameWithoutExtension(entry.Name);
+            byte[] unknownBytes = Formats.ExtractMsndUnknownBytes(data);
+            await File.WriteAllBytesAsync(Path.Combine(baseOut, $"{baseName}.txt"), unknownBytes, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            await File.WriteAllLinesAsync(Path.Combine(baseOut, "mapper.txt"), mapperLines, Encoding.UTF8, ct).ConfigureAwait(false);
+        }
+    }
+    private async Task<string> ExtractEntryAsync(
+        ArchiveEntry entry,
+        string outDir,
+        bool nested,
+        Dictionary<(string, string), int> counters,
+        CancellationToken ct)
+    {
+        byte[] data = await _writer.SerializeEntryAsync(entry, ct).ConfigureAwait(false);
+        return await ExtractChildDataAsync(entry.Name, data, outDir, counters, ct, nested).ConfigureAwait(false);
+    }
+    private async Task<string> ExtractChildDataAsync(
+        string name,
+        byte[] data,
+        string outDir,
+        Dictionary<(string, string), int> counters,
+        CancellationToken ct,
+        bool nested = true)
+    {
+        ArchiveType? type = Formats.DetectTypeFromBuffer(data);
+        if (nested && type.HasValue)
+        {
+            string folderName = GetUniqueName(Path.GetFileNameWithoutExtension(name), "", outDir, counters);
+            string childDir = Path.Combine(outDir, folderName);
+            _ = Directory.CreateDirectory(childDir);
+            await ExtractNestedBufferAsync(data, childDir, Path.GetFileNameWithoutExtension(name), ct).ConfigureAwait(false);
+            return folderName;
+        }
+        string ext = Formats.GuessExtension(data, Path.GetExtension(name));
+        string fileName = GetUniqueName(Path.GetFileNameWithoutExtension(name), ext, outDir, counters);
+        await File.WriteAllBytesAsync(Path.Combine(outDir, fileName), data, ct).ConfigureAwait(false);
+        return fileName;
+    }
+    private async Task ExtractNestedBufferAsync(byte[] data, string outDir, string baseName, CancellationToken ct)
+    {
+        ArchiveType type = Formats.DetectTypeFromBuffer(data)
+            ?? throw new InvalidDataException("Unknown nested archive format.");
+        List<ArchiveEntry> children = ParseChildrenFromBuffer(data, baseName);
+        List<string> mapperLines = new(children.Count);
+        Dictionary<(string, string), int> counters = [];
+        foreach (ArchiveEntry child in children)
+        {
+            ct.ThrowIfCancellationRequested();
+            byte[] childData = data[child.Offset..(child.Offset + child.Size)];
+            string outputName = await ExtractChildDataAsync(child.Name, childData, outDir, counters, ct).ConfigureAwait(false);
+            mapperLines.Add($"{child.Name}={outputName}");
+        }
+        if (type == ArchiveType.MSND)
+        {
+            byte[] unknownBytes = Formats.ExtractMsndUnknownBytes(data);
+            await File.WriteAllBytesAsync(Path.Combine(outDir, $"{baseName}.txt"), unknownBytes, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            await File.WriteAllLinesAsync(Path.Combine(outDir, "mapper.txt"), mapperLines, Encoding.UTF8, ct).ConfigureAwait(false);
+        }
+    }
+    private static List<ArchiveEntry> ParseChildren(byte[] data, string parentName)
+    {
+        ArchiveType? type = Formats.DetectTypeFromBuffer(data);
+        return type.HasValue ? ParseChildrenFromBuffer(data, Path.GetFileNameWithoutExtension(parentName)) : [];
+    }
+    private static List<ArchiveEntry> ParseChildrenFromBuffer(byte[] data, string baseName)
+    {
+        ArchiveType? type = Formats.DetectTypeFromBuffer(data);
+        if (type == ArchiveType.MSND && data.Length >= Formats.MsndHeader)
+        {
+            MsndOffsets offsets = Formats.ParseMsndOffsets(data);
+            return
+            [
+                new ArchiveEntry { Name = $"{baseName}.sseq", Size = offsets.SseqSize, Offset = offsets.SseqOffset },
+                new ArchiveEntry { Name = $"{baseName}.sbnk", Size = offsets.SbnkSize, Offset = offsets.SbnkOffset },
+                new ArchiveEntry { Name = $"{baseName}.swar", Size = offsets.SwarSize, Offset = offsets.SwarOffset }
+            ];
+        }
+        if (type == ArchiveType.DSARC && data.Length >= Formats.DsarcHeader)
+        {
+            int count = BitConverter.ToInt32(data, 8);
+            List<ArchiveEntry> entries = new(count);
+            int pos = Formats.DsarcHeader;
+            for (int i = 0; i < count; i++)
+            {
+                ReadOnlySpan<byte> nameBytes = data.AsSpan(pos, Formats.NameSize);
+                string name = Encoding.UTF8.GetString(nameBytes).Split('\0')[0].Trim();
+                if (string.IsNullOrEmpty(name))
+                {
+                    name = $"file_{i}";
+                }
+                pos += Formats.NameSize;
+                int size = BitConverter.ToInt32(data, pos);
+                int offset = BitConverter.ToInt32(data, pos + 4);
+                pos += Formats.DsarcEntryInfo;
+                entries.Add(new ArchiveEntry { Name = name, Size = size, Offset = offset });
+            }
+            return entries;
+        }
+        return [];
+    }
+    private static string GetUniqueName(string baseName, string ext, string outDir, Dictionary<(string, string), int> counters)
+    {
+        (string, string) key = (baseName, ext ?? "");
+        counters[key] = counters.GetValueOrDefault(key) + 1;
+        int count = counters[key];
+        string candidate = count == 1 ? $"{baseName}{ext}" : $"{baseName}_{count}{ext}";
+        int extra = 1;
+        while (File.Exists(Path.Combine(outDir, candidate)) || Directory.Exists(Path.Combine(outDir, candidate)))
+        {
+            candidate = count == 1 ? $"{baseName}_{extra++}{ext}" : $"{baseName}_{count}_{extra++}{ext}";
+        }
+        return candidate;
+    }
+}
+
+//FolderImportService.cs
+using Disgaea_DS_Manager.Models;
+using System.Text;
+namespace Disgaea_DS_Manager.Services;
+
+public sealed class FolderImportService
+{
+    private static readonly char[] Separator = ['='];
+    private static readonly HashSet<string> MsndExtensionsSet = new(Formats.MsndOrder, StringComparer.OrdinalIgnoreCase);
+    public async Task<ImportResult> AnalyzeFolderAsync(string folder, CancellationToken ct = default)
+    {
+        if (!Directory.Exists(folder))
+        {
+            throw new DirectoryNotFoundException($"Folder not found: {folder}");
+        }
+        ImportResult result = new() { SourceFolder = folder };
+        string mapperPath = Path.Combine(folder, "mapper.txt");
+        if (File.Exists(mapperPath))
+        {
+            await ProcessMapperFileAsync(mapperPath, folder, result, ct).ConfigureAwait(false);
+            result.FileType = ArchiveType.DSARC;
+        }
+        else
+        {
+            await ProcessDirectoryAsync(folder, result, ct).ConfigureAwait(false);
+        }
+        return result;
+    }
+    private async Task ProcessMapperFileAsync(string mapperPath, string folder, ImportResult result, CancellationToken ct)
+    {
+        string[] lines = await File.ReadAllLinesAsync(mapperPath, Encoding.UTF8, ct).ConfigureAwait(false);
+        foreach (string line in lines)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!line.Contains('='))
+            {
+                continue;
+            }
+            string[] parts = line.Split(Separator, 2);
+            string archiveName = parts[0].Trim();
+            string sourceName = parts[1].Trim();
+            string sourcePath = Path.Combine(folder, sourceName);
+            ArchiveEntry entry = await CreateEntryFromSourceAsync(archiveName, sourcePath, ct).ConfigureAwait(false);
+            result.Entries.Add(entry);
+        }
+    }
+    private async Task ProcessDirectoryAsync(string folder, ImportResult result, CancellationToken ct)
+    {
+        List<string> allFiles = Directory.GetFiles(folder, "*", SearchOption.AllDirectories)
+            .Where(f => !f.EndsWith("mapper.txt", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f)
+            .ToList();
+        HashSet<string> extensions = allFiles.Select(f => Path.GetExtension(f).ToUpperInvariant()).ToHashSet();
+        HashSet<string> msndExtensions = Formats.MsndOrder.Select(x => x.ToUpperInvariant()).ToHashSet();
+        bool isMsndStructure = extensions.SetEquals(msndExtensions) ||
+            (allFiles.Select(Path.GetFileNameWithoutExtension).Distinct().Count() == 1 && msndExtensions.IsSubsetOf(extensions));
+        if (isMsndStructure)
+        {
+            result.FileType = ArchiveType.MSND;
+            foreach (string ext in Formats.MsndOrder)
+            {
+                ct.ThrowIfCancellationRequested();
+                string file = allFiles.FirstOrDefault(f => Path.GetExtension(f).Equals(ext, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new FileNotFoundException($"Missing MSND file: {ext}");
+                byte[] data = await File.ReadAllBytesAsync(file, ct).ConfigureAwait(false);
+                result.Entries.Add(new ArchiveEntry
+                {
+                    Name = Path.GetFileName(file),
+                    Size = data.Length,
+                    ImportOrder = result.Entries.Count,
+                    DataSource = new BufferSource(data)
+                });
+            }
+            return;
+        }
+        result.FileType = ArchiveType.DSARC;
+        IOrderedEnumerable<string> topItems = Directory.GetFileSystemEntries(folder, "*", SearchOption.TopDirectoryOnly)
+            .Where(p => !Path.GetFileName(p).Equals("mapper.txt", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(p => p);
+        int importOrder = 0;
+        foreach (string item in topItems)
+        {
+            ct.ThrowIfCancellationRequested();
+            ArchiveEntry entry = await CreateEntryFromSourceAsync(Path.GetFileName(item), item, ct).ConfigureAwait(false);
+            entry.ImportOrder = importOrder++;
+            result.Entries.Add(entry);
+        }
+    }
+    private async Task<ArchiveEntry> CreateEntryFromSourceAsync(string name, string sourcePath, CancellationToken ct)
+    {
+        if (Directory.Exists(sourcePath))
+        {
+            return await CreateEntryFromDirectoryAsync(name, sourcePath, ct).ConfigureAwait(false);
+        }
+        if (!File.Exists(sourcePath))
+        {
+            return new ArchiveEntry { Name = name, Size = 0 };
+        }
+        byte[] data = await File.ReadAllBytesAsync(sourcePath, ct).ConfigureAwait(false);
+        return new ArchiveEntry { Name = name, Size = data.Length, DataSource = new BufferSource(data) };
+    }
+    private async Task<ArchiveEntry> CreateEntryFromDirectoryAsync(string name, string directory, CancellationToken ct)
+    {
+        ArchiveEntry entry = new() { Name = name, NestedType = DetectContainerType(directory) };
+        try
+        {
+            byte[] data = await BuildNestedArchiveAsync(directory, ct).ConfigureAwait(false);
+            entry.Size = data.Length;
+            entry.DataSource = new BufferSource(data);
+            ArchiveType? detectedType = Formats.DetectTypeFromBuffer(data);
+            if (detectedType == ArchiveType.MSND)
+            {
+                entry.NestedType = ArchiveType.MSND;
+                Formats.PopulateMsndChildren(data, entry, Path.GetFileNameWithoutExtension(entry.Name));
+            }
+            else if (detectedType == ArchiveType.DSARC)
+            {
+                entry.NestedType = ArchiveType.DSARC;
+                PopulateDsarcChildren(data, entry);
+            }
+        }
+        catch { }
+        return entry;
+    }
+    private static void PopulateDsarcChildren(byte[] dsarcData, ArchiveEntry parent)
+    {
+        try
+        {
+            if (dsarcData.Length < Formats.DsarcHeader || !dsarcData.AsSpan(0, 8).SequenceEqual(Formats.MagicDsarc))
+            {
+                return;
+            }
+            int count = BitConverter.ToInt32(dsarcData, 8);
+            int version = BitConverter.ToInt32(dsarcData, 12);
+            if (version != Formats.DsarcVersion)
+            {
+                return;
+            }
+            parent.Children.Clear();
+            int pos = Formats.DsarcHeader;
+            for (int i = 0; i < count; i++)
+            {
+                ReadOnlySpan<byte> nameBytes = dsarcData.AsSpan(pos, Formats.NameSize);
+                string name = System.Text.Encoding.UTF8.GetString(nameBytes).Split('\0')[0].Trim();
+                if (string.IsNullOrEmpty(name))
+                {
+                    name = $"file_{i}";
+                }
+                pos += Formats.NameSize;
+                int size = BitConverter.ToInt32(dsarcData, pos);
+                int offset = BitConverter.ToInt32(dsarcData, pos + 4);
+                pos += Formats.DsarcEntryInfo;
+                if (offset < 0 || size < 0 || offset + size > dsarcData.Length)
+                {
+                    continue;
+                }
+                ArchiveEntry child = new()
+                {
+                    Name = name,
+                    Size = size,
+                    Offset = offset,
+                    ImportOrder = i,
+                    DataSource = new BufferSource(dsarcData[offset..(offset + size)])
+                };
+                ReadOnlySpan<byte> entryData = dsarcData.AsSpan(offset, Math.Min(size, 8));
+                if (size >= 4 && entryData[..Math.Min(4, entryData.Length)].SequenceEqual(Formats.MagicMsnd))
+                {
+                    child.NestedType = ArchiveType.MSND;
+                    string baseName = Path.GetFileNameWithoutExtension(name);
+                    Formats.PopulateMsndChildren(dsarcData[offset..(offset + size)], child, baseName);
+                }
+                else if (size >= 8 && entryData[..Math.Min(8, entryData.Length)].SequenceEqual(Formats.MagicDsarc))
+                {
+                    child.NestedType = ArchiveType.DSARC;
+                }
+                parent.Children.Add(child);
+            }
+        }
+        catch { }
+    }
+    private async Task<byte[]> BuildNestedArchiveAsync(string folder, CancellationToken ct)
+    {
+        List<string> allFiles = Directory.GetFiles(folder, "*", SearchOption.AllDirectories)
+            .Where(f => !f.EndsWith("mapper.txt", StringComparison.OrdinalIgnoreCase) && !f.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        HashSet<string> extensions = allFiles.Select(f => Path.GetExtension(f).ToUpperInvariant()).ToHashSet();
+        HashSet<string> msndExtensions = Formats.MsndOrder.Select(x => x.ToUpperInvariant()).ToHashSet();
+        if (extensions.SetEquals(msndExtensions) || msndExtensions.IsSubsetOf(extensions))
+        {
+            Dictionary<string, byte[]> chunks = new(StringComparer.OrdinalIgnoreCase);
+            foreach (string ext in Formats.MsndOrder)
+            {
+                string file = allFiles.FirstOrDefault(f => Path.GetExtension(f).Equals(ext, StringComparison.OrdinalIgnoreCase))
+                    ?? throw new FileNotFoundException($"Missing: {ext}");
+                chunks[ext] = await File.ReadAllBytesAsync(file, ct).ConfigureAwait(false);
+            }
+            byte[]? unknownBytes = await ReadMsndUnknownBytesAsync(folder, ct).ConfigureAwait(false);
+            return Formats.BuildMsnd(chunks, unknownBytes);
+        }
+        string mapperPath = Path.Combine(folder, "mapper.txt");
+        return File.Exists(mapperPath)
+            ? await BuildDsarcFromMapperAsync(mapperPath, folder, ct).ConfigureAwait(false)
+            : await BuildDsarcFromFilesAsync(folder, ct).ConfigureAwait(false);
+    }
+    private static async Task<byte[]?> ReadMsndUnknownBytesAsync(string folder, CancellationToken ct)
+    {
+        List<string> txtFiles = Directory.GetFiles(folder, "*.txt", SearchOption.TopDirectoryOnly)
+            .Where(f => !Path.GetFileName(f).Equals("mapper.txt", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (txtFiles.Count == 0)
+        {
+            return null;
+        }
+        byte[] data = await File.ReadAllBytesAsync(txtFiles[0], ct).ConfigureAwait(false);
+        if (data.Length >= 4)
+        {
+            return data[..4];
+        }
+        if (data.Length > 0)
+        {
+            byte[] padded = new byte[4];
+            data.CopyTo(padded, 0);
+            return padded;
+        }
+        return null;
+    }
+    private async Task<byte[]> BuildDsarcFromMapperAsync(string mapperPath, string folder, CancellationToken ct)
+    {
+        string[] lines = await File.ReadAllLinesAsync(mapperPath, Encoding.UTF8, ct).ConfigureAwait(false);
+        List<(string Name, byte[] Data)> pairs = new(lines.Length);
+        foreach (string line in lines)
+        {
+            if (!line.Contains('='))
+            {
+                continue;
+            }
+            string[] parts = line.Split(Separator, 2);
+            string archiveName = parts[0].Trim();
+            string sourceName = parts[1].Trim();
+            string sourcePath = Path.Combine(folder, sourceName);
+            byte[] data = Directory.Exists(sourcePath)
+                ? await BuildNestedArchiveAsync(sourcePath, ct).ConfigureAwait(false)
+                : File.Exists(sourcePath)
+                ? await File.ReadAllBytesAsync(sourcePath, ct).ConfigureAwait(false)
+                : throw new FileNotFoundException($"Source not found: {sourcePath}");
+            pairs.Add((archiveName, data));
+        }
+        return BuildDsarc(pairs);
+    }
+    private async Task<byte[]> BuildDsarcFromFilesAsync(string folder, CancellationToken ct)
+    {
+        IEnumerable<string> items = Directory.GetFileSystemEntries(folder, "*", SearchOption.TopDirectoryOnly)
+            .Where(p => !Path.GetFileName(p).Equals("mapper.txt", StringComparison.OrdinalIgnoreCase));
+        List<(string Name, byte[] Data)> pairs = [];
+        foreach (string item in items)
+        {
+            ct.ThrowIfCancellationRequested();
+            string name = Path.GetFileName(item);
+            byte[] data = Directory.Exists(item)
+                ? await BuildNestedArchiveAsync(item, ct).ConfigureAwait(false)
+                : await File.ReadAllBytesAsync(item, ct).ConfigureAwait(false);
+            pairs.Add((name, data));
+        }
+        return BuildDsarc(pairs);
+    }
+    private static byte[] BuildDsarc(List<(string Name, byte[] Data)> pairs)
+    {
+        int count = pairs.Count;
+        int headerSize = Formats.DsarcHeader + (count * (Formats.NameSize + Formats.DsarcEntryInfo));
+        int totalDataSize = pairs.Sum(p => p.Data.Length);
+        using MemoryStream ms = new(headerSize + totalDataSize);
+        using BinaryWriter bw = new(ms);
+        bw.Write(Formats.MagicDsarc);
+        bw.Write(count);
+        bw.Write(Formats.DsarcVersion);
+        int offset = headerSize;
+        foreach ((string name, byte[] data) in pairs)
+        {
+            bw.Write(Formats.PadName(name));
+            bw.Write(data.Length);
+            bw.Write(offset);
+            offset += data.Length;
+        }
+        foreach ((_, byte[] data) in pairs)
+        {
+            bw.Write(data);
+        }
+        return ms.ToArray();
+    }
+    public static ArchiveType DetectContainerType(string directoryPath)
+    {
+        if (!Directory.Exists(directoryPath))
+        {
+            return ArchiveType.DSARC;
+        }
+        try
+        {
+            List<string> files = Directory.GetFiles(directoryPath, "*", SearchOption.TopDirectoryOnly)
+                .Where(f => !f.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            HashSet<string> extensions = files.Select(f => Path.GetExtension(f).ToLowerInvariant()).ToHashSet();
+            if (extensions.Count > 0 && extensions.All(MsndExtensionsSet.Contains))
+            {
+                if (MsndExtensionsSet.IsSubsetOf(extensions) || extensions.SetEquals(MsndExtensionsSet))
+                {
+                    return ArchiveType.MSND;
+                }
+            }
+            List<string> txtFiles = Directory.GetFiles(directoryPath, "*.txt", SearchOption.TopDirectoryOnly)
+                .Where(f => !Path.GetFileName(f).Equals("mapper.txt", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            HashSet<string> msndExtUpper = Formats.MsndOrder.Select(x => x.ToLowerInvariant()).ToHashSet();
+            if (txtFiles.Count > 0 && extensions.SetEquals(msndExtUpper))
+            {
+                return ArchiveType.MSND;
+            }
+        }
+        catch { }
+        return ArchiveType.DSARC;
+    }
+}
+
+//MainWindow.axaml
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Disgaea_DS_Manager.MainWindow"
+        Title="Disgaea DS Manager"
+        Width="1000" Height="700"
+        MinWidth="600" MinHeight="400">
+  <Window.Resources>
+    <SolidColorBrush x:Key="ModifiedBrush" Color="#FF8800" />
+    <SolidColorBrush x:Key="DropIndicatorBrush" Color="#0078D4" />
+  </Window.Resources>
+  <Panel>
+    <DockPanel LastChildFill="True">
+      <Menu DockPanel.Dock="Top">
+        <MenuItem Header="_File">
+          <MenuItem x:Name="NewMenu" Header="_New..." InputGesture="Ctrl+N" />
+          <MenuItem x:Name="OpenMenu" Header="_Open..." InputGesture="Ctrl+O" />
+          <Separator/>
+          <MenuItem x:Name="SaveMenu" Header="_Save" InputGesture="Ctrl+S" />
+          <MenuItem x:Name="SaveAsMenu" Header="Save _As..." InputGesture="Ctrl+Shift+S" />
+          <Separator/>
+          <MenuItem x:Name="ExitMenu" Header="E_xit" InputGesture="Alt+F4" />
+        </MenuItem>
+        <MenuItem Header="_Edit">
+          <MenuItem x:Name="UndoMenu" Header="_Undo" InputGesture="Ctrl+Z" />
+          <MenuItem x:Name="RedoMenu" Header="_Redo" InputGesture="Ctrl+Y" />
+          <Separator/>
+          <MenuItem x:Name="SortMenu" Header="_Sort by Alphabetical Order" />
+          <MenuItem x:Name="SortRecursiveMenu" Header="Sort _Recursively by Alphabetical Order" />
+        </MenuItem>
+        <MenuItem Header="_Help">
+          <MenuItem x:Name="InfoMenu" Header="_About" />
+        </MenuItem>
+      </Menu>
+      <Grid DockPanel.Dock="Bottom" Margin="8,4">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="200" />
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="StatusLabel" Text="Ready" VerticalAlignment="Center" Grid.Column="0" />
+        <TextBlock x:Name="ModifiedLabel" Text="" Margin="8,0" VerticalAlignment="Center" Grid.Column="1"
+                   Foreground="#FF8800" FontWeight="Bold" />
+        <ProgressBar x:Name="ProgressBar" Grid.Column="2" Minimum="0" Maximum="100" Value="0"
+                     VerticalAlignment="Center" Height="16" />
+      </Grid>
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="2*" MinHeight="200" />
+          <RowDefinition Height="4" />
+          <RowDefinition Height="*" MinHeight="100" />
+        </Grid.RowDefinitions>
+        <Border Grid.Row="0" Margin="8,8,8,4" BorderBrush="#40808080" BorderThickness="1" CornerRadius="4">
+          <TreeView x:Name="TreeView" />
+        </Border>
+        <GridSplitter Grid.Row="1" Height="4" HorizontalAlignment="Stretch" Background="Transparent" />
+        <Border Grid.Row="2" Margin="8,4,8,8" BorderBrush="#40808080" BorderThickness="1" CornerRadius="4">
+          <DockPanel>
+            <TextBlock DockPanel.Dock="Top" Text="Log" FontWeight="SemiBold" Margin="8,4" Opacity="0.6" />
+            <TextBox x:Name="LogTextBox"
+                     AcceptsReturn="True"
+                     IsReadOnly="True"
+                     TextWrapping="Wrap"
+                     BorderThickness="0"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto" />
+          </DockPanel>
+        </Border>
+      </Grid>
+    </DockPanel>
+    <Canvas x:Name="DragOverlay" IsHitTestVisible="False" />
+  </Panel>
+</Window>
+
+//MainWindow.axaml.cs
+using Avalonia;
+using Avalonia.Collections;
+using Avalonia.Controls;
+using Avalonia.Controls.Shapes;
+using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
+using Disgaea_DS_Manager.Commands;
+using Disgaea_DS_Manager.Models;
+using Disgaea_DS_Manager.Services;
+namespace Disgaea_DS_Manager;
+
+public partial class MainWindow : Window
+{
+    private readonly DocumentManager _manager = new();
+    private CancellationTokenSource? _cts;
+    private TreeViewItem? _rootItem;
+    private MenuItem _undoMenu = null!;
+    private MenuItem _redoMenu = null!;
+    private MenuItem _sortMenu = null!;
+    private MenuItem _sortRecursiveMenu = null!;
+    private TreeView _treeView = null!;
+    private TextBlock _statusLabel = null!;
+    private TextBlock _modifiedLabel = null!;
+    private ProgressBar _progressBar = null!;
+    private TextBox _logTextBox = null!;
+    private Canvas _dragOverlay = null!;
+    private bool _isDragPending;
+    private bool _isDragging;
+    private Point _dragStartPos;
+    private TreeViewItem? _dragSourceItem;
+    private ArchiveEntry? _dragSourceEntry;
+    private Border? _dragGhost;
+    private Rectangle? _dropIndicator;
+    private Border? _dropHighlight;
+    private DropTarget? _currentDropTarget;
+    private readonly Dictionary<long, bool> _expansionState = [];
+    private const double DragThreshold = 6.0;
+    private const int MaxLogLines = 500;
+    private static readonly IBrush ModifiedBrush = new SolidColorBrush(Color.Parse("#FF8800"));
+    private static readonly IBrush DropIndicatorBrush = new SolidColorBrush(Color.Parse("#0078D4"));
+    private static readonly IBrush DropHighlightBrush = new SolidColorBrush(Color.Parse("#200078D4"));
+    private static readonly IBrush DropHighlightBorder = new SolidColorBrush(Color.Parse("#0078D4"));
+    private static readonly IBrush GhostBackground = new SolidColorBrush(Color.Parse("#E8F0FE"));
+    private static readonly IBrush GhostBorder = new SolidColorBrush(Color.Parse("#0078D4"));
+    private record DropTarget(ArchiveEntry Entry, TreeViewItem Item, DropPosition Position, ArchiveEntry? Parent);
+    private enum DropPosition { Before, After, Inside }
+    public MainWindow()
+    {
+        InitializeComponent();
+        if (!Design.IsDesignMode)
+        {
+            InitializeControls();
+            WireEvents();
+            _manager.DocumentChanged += RefreshTree;
+            UpdateEditMenu();
+        }
+    }
+    private void InitializeControls()
+    {
+        _undoMenu = this.FindControl<MenuItem>("UndoMenu")!;
+        _redoMenu = this.FindControl<MenuItem>("RedoMenu")!;
+        _sortMenu = this.FindControl<MenuItem>("SortMenu")!;
+        _sortRecursiveMenu = this.FindControl<MenuItem>("SortRecursiveMenu")!;
+        _treeView = this.FindControl<TreeView>("TreeView")!;
+        _statusLabel = this.FindControl<TextBlock>("StatusLabel")!;
+        _modifiedLabel = this.FindControl<TextBlock>("ModifiedLabel")!;
+        _progressBar = this.FindControl<ProgressBar>("ProgressBar")!;
+        _logTextBox = this.FindControl<TextBox>("LogTextBox")!;
+        _dragOverlay = this.FindControl<Canvas>("DragOverlay")!;
+    }
+    private void WireEvents()
+    {
+        this.FindControl<MenuItem>("NewMenu")!.Click += async (_, _) => await NewArchiveAsync();
+        this.FindControl<MenuItem>("OpenMenu")!.Click += async (_, _) => await OpenArchiveAsync();
+        this.FindControl<MenuItem>("SaveMenu")!.Click += async (_, _) => await SaveAsync();
+        this.FindControl<MenuItem>("SaveAsMenu")!.Click += async (_, _) => await SaveAsAsync();
+        this.FindControl<MenuItem>("ExitMenu")!.Click += (_, _) => Close();
+        _undoMenu.Click += (_, _) => { if (_manager.CanUndo) { _ = _manager.Undo(); Log("Undo"); } };
+        _redoMenu.Click += (_, _) => { if (_manager.CanRedo) { _ = _manager.Redo(); Log("Redo"); } };
+        _sortMenu.Click += async (_, _) => { await _manager.SortAlphabeticallyAsync(); Log("Sorted"); };
+        _sortRecursiveMenu.Click += async (_, _) => { await _manager.SortAlphabeticallyRecursiveAsync(); Log("Sorted Recursively"); };
+        this.FindControl<MenuItem>("InfoMenu")!.Click += async (_, _) => await DialogService.ShowInfoAsync(this);
+        _treeView.SelectionChanged += (_, _) => UpdateEditMenu();
+        _treeView.AddHandler(PointerPressedEvent, OnPointerPressed, RoutingStrategies.Tunnel);
+        _treeView.AddHandler(PointerMovedEvent, OnPointerMoved, RoutingStrategies.Tunnel);
+        _treeView.AddHandler(PointerReleasedEvent, OnPointerReleased, RoutingStrategies.Tunnel);
+    }
+    private void OnPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (!e.GetCurrentPoint(_treeView).Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+        TreeViewItem? item = (e.Source as Visual)?.FindAncestorOfType<TreeViewItem>();
+        if (item is null || item == _rootItem)
+        {
+            return;
+        }
+        if (item.DataContext is not ArchiveEntry entry)
+        {
+            return;
+        }
+        if (_manager.Current.FileType != ArchiveType.DSARC)
+        {
+            return;
+        }
+        if (item.Parent is TreeViewItem { DataContext: ArchiveEntry { NestedType: ArchiveType.MSND } })
+        {
+            return;
+        }
+        _dragStartPos = e.GetPosition(this);
+        _isDragPending = true;
+        _dragSourceItem = item;
+        _dragSourceEntry = entry;
+    }
+    private void OnPointerMoved(object? sender, PointerEventArgs e)
+    {
+        Point pos = e.GetPosition(this);
+        if (_isDragPending && !_isDragging)
+        {
+            Point delta = pos - _dragStartPos;
+            if (Math.Abs(delta.X) > DragThreshold || Math.Abs(delta.Y) > DragThreshold)
+            {
+                StartDrag();
+            }
+            return;
+        }
+        if (_isDragging)
+        {
+            UpdateDrag(pos, e.GetPosition(_treeView));
+        }
+    }
+    private void OnPointerReleased(object? sender, PointerReleasedEventArgs e)
+    {
+        if (e.InitialPressMouseButton == MouseButton.Right && !_isDragging)
+        {
+            TreeViewItem? item = (e.Source as Visual)?.FindAncestorOfType<TreeViewItem>();
+            if (item is not null)
+            {
+                _treeView.SelectedItem = item;
+                ShowContextMenu(item);
+                e.Handled = true;
+            }
+        }
+        if (_isDragging) { FinishDrag(); e.Handled = true; }
+        CancelDrag();
+    }
+    private void StartDrag()
+    {
+        if (_dragSourceEntry is null)
+        {
+            return;
+        }
+        _isDragging = true;
+        _isDragPending = false;
+        _dragGhost = new Border
+        {
+            Background = GhostBackground,
+            BorderBrush = GhostBorder,
+            BorderThickness = new Thickness(1.5),
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(10, 6),
+            Opacity = 0.95,
+            Child = new TextBlock { Text = _dragSourceEntry.Name, FontWeight = FontWeight.Medium }
+        };
+        _dragOverlay.Children.Add(_dragGhost);
+        _dropIndicator = new Rectangle { Height = 2, Fill = DropIndicatorBrush, IsVisible = false };
+        _dragOverlay.Children.Add(_dropIndicator);
+        _dropHighlight = new Border { Background = DropHighlightBrush, BorderBrush = DropHighlightBorder, BorderThickness = new Thickness(2), CornerRadius = new CornerRadius(3), IsVisible = false };
+        _dragOverlay.Children.Insert(0, _dropHighlight);
+        _ = _dragSourceItem?.Opacity = 0.4;
+    }
+    private void UpdateDrag(Point windowPos, Point treePos)
+    {
+        if (_dragGhost is not null)
+        {
+            Canvas.SetLeft(_dragGhost, windowPos.X + 12);
+            Canvas.SetTop(_dragGhost, windowPos.Y + 12);
+        }
+        DropTarget? target = FindDropTarget(treePos);
+        _currentDropTarget = target;
+        _ = _dropIndicator?.IsVisible = false;
+        _ = _dropHighlight?.IsVisible = false;
+        if (target is null || target.Entry == _dragSourceEntry)
+        {
+            return;
+        }
+        Rect? itemBounds = GetItemBoundsInWindow(target.Item);
+        if (!itemBounds.HasValue)
+        {
+            return;
+        }
+        if (target.Position == DropPosition.Inside)
+        {
+            if (_dropHighlight is not null)
+            {
+                _dropHighlight.IsVisible = true;
+                _dropHighlight.Width = itemBounds.Value.Width;
+                _dropHighlight.Height = itemBounds.Value.Height;
+                Canvas.SetLeft(_dropHighlight, itemBounds.Value.X);
+                Canvas.SetTop(_dropHighlight, itemBounds.Value.Y);
+            }
+        }
+        else if (_dropIndicator is not null)
+        {
+            _dropIndicator.IsVisible = true;
+            _dropIndicator.Width = itemBounds.Value.Width;
+            _dropIndicator.Height = 2;
+            double indicatorY = target.Position == DropPosition.Before ? itemBounds.Value.Y - 1 : itemBounds.Value.Bottom - 1;
+            Canvas.SetLeft(_dropIndicator, itemBounds.Value.X);
+            Canvas.SetTop(_dropIndicator, indicatorY);
+        }
+    }
+    private Rect? GetItemBoundsInWindow(TreeViewItem item)
+    {
+        try
+        {
+            Point? topLeft = item.TranslatePoint(new Point(0, 0), this);
+            return topLeft is null ? null : new Rect(topLeft.Value, item.Bounds.Size);
+        }
+        catch { return null; }
+    }
+    private DropTarget? FindDropTarget(Point treePos)
+    {
+        if (_rootItem is null)
+        {
+            return null;
+        }
+        foreach ((TreeViewItem item, ArchiveEntry? parent, bool isInsideMsnd) in GetVisibleTreeItemsWithContext(_rootItem))
+        {
+            if (item.DataContext is not ArchiveEntry entry)
+            {
+                continue;
+            }
+            if (entry == _dragSourceEntry)
+            {
+                continue;
+            }
+            if (isInsideMsnd)
+            {
+                continue;
+            }
+            Point? itemPos = item.TranslatePoint(new Point(0, 0), _treeView);
+            if (itemPos is null)
+            {
+                continue;
+            }
+            Rect bounds = new(itemPos.Value, item.Bounds.Size);
+            if (!bounds.Contains(treePos))
+            {
+                continue;
+            }
+            double relY = treePos.Y - bounds.Y;
+            if (entry.NestedType == ArchiveType.DSARC)
+            {
+                bool isExpanded = item.IsExpanded;
+                bool hasChildren = entry.Children.Count > 0;
+                if (isExpanded && hasChildren)
+                {
+                    return relY < bounds.Height / 2
+                        ? new DropTarget(entry, item, DropPosition.Before, parent)
+                        : new DropTarget(entry, item, DropPosition.After, parent);
+                }
+                double quarter = bounds.Height / 4;
+                return relY < quarter
+                    ? new DropTarget(entry, item, DropPosition.Before, parent)
+                    : relY > bounds.Height - quarter
+                    ? new DropTarget(entry, item, DropPosition.After, parent)
+                    : new DropTarget(entry, item, DropPosition.Inside, parent);
+            }
+            return new DropTarget(entry, item, relY < bounds.Height / 2 ? DropPosition.Before : DropPosition.After, parent);
+        }
+        return null;
+    }
+    private static IEnumerable<(TreeViewItem Item, ArchiveEntry? Parent, bool IsInsideMsnd)> GetVisibleTreeItemsWithContext(TreeViewItem parent, ArchiveEntry? parentEntry = null, bool parentIsMsnd = false)
+    {
+        if (parent.ItemsSource is not IEnumerable<TreeViewItem> children)
+        {
+            yield break;
+        }
+        foreach (TreeViewItem child in children)
+        {
+            ArchiveEntry? childEntry = child.DataContext as ArchiveEntry;
+            bool isMsnd = childEntry?.NestedType == ArchiveType.MSND;
+            if (child.IsExpanded)
+            {
+                foreach ((TreeViewItem Item, ArchiveEntry? Parent, bool IsInsideMsnd) grandchild in GetVisibleTreeItemsWithContext(child, childEntry, isMsnd || parentIsMsnd))
+                {
+                    yield return grandchild;
+                }
+            }
+            yield return (child, parentEntry, parentIsMsnd);
+        }
+    }
+    private async void FinishDrag()
+    {
+        if (_dragSourceEntry is null || _currentDropTarget is null)
+        {
+            return;
+        }
+        if (_currentDropTarget.Entry == _dragSourceEntry)
+        {
+            return;
+        }
+        DropTarget target = _currentDropTarget;
+        if (target.Position == DropPosition.Inside && target.Entry.NestedType == ArchiveType.DSARC)
+        {
+            await _manager.MoveEntryToContainerAsync(_dragSourceEntry, target.Entry);
+            Log($"Moved '{_dragSourceEntry.Name}' into '{target.Entry.Name}'");
+        }
+        else
+        {
+            ArchiveEntry? targetParent = target.Parent;
+            long? destParentId = targetParent?.Id;
+            List<ArchiveEntry> targetSiblings = GetTargetSiblings(targetParent);
+            int targetIdx = targetSiblings.FindIndex(c => c.Id == target.Entry.Id);
+            if (targetIdx < 0)
+            {
+                return;
+            }
+            int newIdx = target.Position == DropPosition.After ? targetIdx + 1 : targetIdx;
+            ArchiveEntry? sourceParent = EntryFinder.FindParent(_manager.Current.RootEntry, _dragSourceEntry.Id);
+            bool sameParent = (sourceParent?.Id ?? 0) == (targetParent?.Id ?? 0);
+            if (sameParent)
+            {
+                int sourceIdx = targetSiblings.FindIndex(c => c.Id == _dragSourceEntry.Id);
+                if (sourceIdx >= 0 && sourceIdx < newIdx)
+                {
+                    newIdx--;
+                }
+            }
+            await _manager.MoveEntryAsync(_dragSourceEntry, destParentId, newIdx);
+            Log($"Moved '{_dragSourceEntry.Name}'");
+        }
+    }
+    private List<ArchiveEntry> GetTargetSiblings(ArchiveEntry? targetParent)
+    {
+        if (targetParent is null)
+        {
+            return _manager.Current.RootEntry.Children;
+        }
+        ArchiveEntry? parentInDoc = EntryFinder.FindById(_manager.Current.RootEntry, targetParent.Id);
+        return parentInDoc?.Children ?? _manager.Current.RootEntry.Children;
+    }
+    private void CancelDrag()
+    {
+        _isDragPending = false;
+        _isDragging = false;
+        _currentDropTarget = null;
+        _ = _dragSourceItem?.Opacity = 1.0;
+        _dragOverlay.Children.Clear();
+        _dragGhost = null;
+        _dropIndicator = null;
+        _dropHighlight = null;
+        _dragSourceItem = null;
+        _dragSourceEntry = null;
+    }
+    private void ShowContextMenu(TreeViewItem node)
+    {
+        AvaloniaList<Control> items = [];
+        bool isRoot = node == _rootItem;
+        ArchiveEntry? entry = node.DataContext as ArchiveEntry;
+        ArchiveType docType = _manager.Current.FileType;
+        if (isRoot)
+        {
+            items.Add(MenuItem("Import Folder", ImportFolderAsync));
+            items.Add(MenuItem("Extract All", () => ExtractAllAsync(false)));
+            if (docType == ArchiveType.DSARC)
+            {
+                items.Add(MenuItem("Extract All (Nested)", () => ExtractAllAsync(true)));
+                items.Add(new Separator());
+                items.Add(MenuItem("Add Blank File", () => AddBlankFileAsync(null)));
+                items.Add(MenuItem("Add Blank DSARC", () => AddBlankContainerAsync(null, ArchiveType.DSARC)));
+                items.Add(MenuItem("Add Blank DSEQ", () => AddBlankContainerAsync(null, ArchiveType.MSND)));
+            }
+        }
+        else if (entry is not null)
+        {
+            bool isInMsnd = node.Parent is TreeViewItem { DataContext: ArchiveEntry { NestedType: ArchiveType.MSND } };
+            if (entry.IsNested && entry.Children.Count > 0)
+            {
+                items.Add(MenuItem("Import Folder", () => ImportToNestedAsync(entry)));
+                items.Add(MenuItem("Extract All", () => ExtractNestedAsync(entry)));
+            }
+            bool isTopLevel = node.Parent == _rootItem;
+            if (isTopLevel || docType == ArchiveType.MSND)
+            {
+                items.Add(MenuItem("Extract", () => ExtractSingleAsync(entry)));
+                items.Add(MenuItem("Replace", () => RenameEntryAsync(entry)));
+                items.Add(MenuItem("Rename", () => RenameEntryAsync(entry)));
+            }
+            else if (node.Parent is TreeViewItem { DataContext: ArchiveEntry parent })
+            {
+                items.Add(MenuItem("Extract File", () => ExtractSingleAsync(entry)));
+                if (parent.NestedType == ArchiveType.MSND)
+                {
+                    items.Add(MenuItem("Replace File", () => ReplaceChunkAsync(parent, entry)));
+                }
+                else
+                {
+                    items.Add(MenuItem("Replace", () => RenameEntryAsync(entry)));
+                }
+                if (!isInMsnd)
+                {
+                    items.Add(MenuItem("Rename", () => RenameEntryAsync(entry)));
+                }
+            }
+            if (!isInMsnd)
+            {
+                if (items.Count > 0)
+                {
+                    items.Add(new Separator());
+                }
+                items.Add(MenuItem("Delete", () => DeleteEntryAsync(entry)));
+            }
+            if (entry.NestedType == ArchiveType.DSARC)
+            {
+                items.Add(new Separator());
+                if (_manager.CanSortContainer(entry))
+                {
+                    items.Add(MenuItem("Sort Contents", () => SortContainerAsync(entry)));
+                    items.Add(MenuItem("Sort Contents (Recursive)", () => SortRecursiveAsync(entry)));
+                }
+                items.Add(MenuItem("Add Blank File", () => AddBlankFileAsync(entry)));
+                items.Add(MenuItem("Add Blank DSARC", () => AddBlankContainerAsync(entry, ArchiveType.DSARC)));
+                items.Add(MenuItem("Add Blank DSEQ", () => AddBlankContainerAsync(entry, ArchiveType.MSND)));
+            }
+        }
+        if (items.Count == 0)
+        {
+            return;
+        }
+        ContextMenu menu = new() { ItemsSource = items, PlacementTarget = node };
+        menu.Open(node);
+    }
+    private async Task SortContainerAsync(ArchiveEntry container)
+    {
+        await _manager.SortAlphabeticallyAsync(container);
+        Log($"Sorted contents of '{container.Name}'");
+    }
+    private async Task SortRecursiveAsync(ArchiveEntry? container)
+    {
+        await _manager.SortAlphabeticallyRecursiveAsync(container);
+        Log($"Sorted contents of '{container?.Name ?? "Root"}' (Recursive)");
+    }
+    private static MenuItem MenuItem(string header, Func<Task> action)
+    {
+        MenuItem item = new() { Header = header };
+        item.Click += async (_, _) => await action();
+        return item;
+    }
+    private static FilePickerFileType ArchiveFileFilter => new("Disgaea Archives") { Patterns = ["*.dat", "*.msnd"] };
+    private async Task<string?> PickOpenFileAsync(string title, bool archives = true)
+    {
+        IReadOnlyList<IStorageFile> result = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = title,
+            AllowMultiple = false,
+            FileTypeFilter = archives ? [ArchiveFileFilter, FilePickerFileTypes.All] : [FilePickerFileTypes.All]
+        });
+        return result.Count > 0 ? result[0].TryGetLocalPath() : null;
+    }
+    private async Task<string?> PickSaveFileAsync(string title, string? name = null)
+    {
+        IStorageFile? result = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = title,
+            SuggestedFileName = name,
+            FileTypeChoices = [ArchiveFileFilter, FilePickerFileTypes.All]
+        });
+        return result?.TryGetLocalPath();
+    }
+    private async Task<string?> PickFolderAsync(string title)
+    {
+        IReadOnlyList<IStorageFolder> result = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions { Title = title });
+        return result.Count > 0 ? result[0].TryGetLocalPath() : null;
+    }
+    private async Task NewArchiveAsync()
+    {
+        ArchiveTypeChoice? choice = await DialogService.ShowNewFileDialogAsync(this);
+        if (choice is null)
+        {
+            return;
+        }
+        ArchiveType type = choice == ArchiveTypeChoice.DSARC ? ArchiveType.DSARC : ArchiveType.MSND;
+        if (type == ArchiveType.DSARC)
+        {
+            await DialogService.ShowMessageAsync(this, "New DSARC",
+                "A new empty DSARC has been created.\n\n" +
+                "Note: You must add at least one file before saving. " +
+                "Use the right-click context menu to add files or nested archives.");
+        }
+        _ = _manager.CreateNewEmpty(type);
+        Log($"Created new {(type == ArchiveType.DSARC ? "DSARC" : "DSEQ")}");
+    }
+    private async Task OpenArchiveAsync()
+    {
+        string? path = await PickOpenFileAsync("Open Archive");
+        if (path is null)
+        {
+            return;
+        }
+        try
+        {
+            _expansionState.Clear();
+            await RunAsync(ct => _manager.LoadArchiveAsync(path, ct), $"Opened: {System.IO.Path.GetFileName(path)}");
+        }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task SaveAsync()
+    {
+        if (_manager.Current.FilePath is null)
+        {
+            await SaveAsAsync();
+            return;
+        }
+        if (!await ValidateBeforeSaveAsync())
+        {
+            return;
+        }
+        await DoSaveAsync(_manager.Current.FilePath);
+    }
+    private async Task SaveAsAsync()
+    {
+        if (!await ValidateBeforeSaveAsync())
+        {
+            return;
+        }
+        string name = _manager.Current.FilePath is not null
+            ? System.IO.Path.GetFileName(_manager.Current.FilePath)
+            : _manager.Current.FileType == ArchiveType.MSND ? "archive.msnd" : "archive.dat";
+        string? path = await PickSaveFileAsync("Save Archive As", name);
+        if (path is not null)
+        {
+            await DoSaveAsync(path);
+        }
+    }
+    private async Task<bool> ValidateBeforeSaveAsync()
+    {
+        if (_manager.IsRootEmpty())
+        {
+            string archiveType = _manager.Current.FileType == ArchiveType.DSARC ? "DSARC" : "DSEQ";
+            await DialogService.ShowErrorAsync(this, $"Cannot save an empty {archiveType} archive.\n\nPlease add content before saving.");
+            return false;
+        }
+        if (_manager.HasBlankFiles())
+        {
+            string message = "The archive contains blank files or empty containers.\n\n" +
+                             "Yes: Remove all blank files/empty folders and save\n" +
+                             "No: Save without removing blank files\n" +
+                             "Cancel: Do not save";
+            ConfirmResult result = await DialogService.ShowConfirmWithCancelAsync(this, "Blank Files Detected", message);
+            if (result == ConfirmResult.Yes)
+            {
+                await _manager.RemoveAllEmptyEntriesAsync();
+                Log("Removed blank files and empty archives.");
+            }
+            else if (result == ConfirmResult.Cancel)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    private async Task DoSaveAsync(string path)
+    {
+        try
+        {
+            Progress<double> progress = new(v =>
+            {
+                Dispatcher.UIThread.Post(() => _progressBar.Value = v * 100);
+            });
+            await RunAsync(ct => _manager.SaveArchiveAsync(path, progress, ct), "Saved");
+        }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task ImportFolderAsync()
+    {
+        string? folder = await PickFolderAsync("Select Folder");
+        if (folder is null)
+        {
+            return;
+        }
+        try
+        {
+            _expansionState.Clear();
+            await RunAsync(ct => _manager.ImportFolderAsync(folder, ct), "Imported");
+        }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task ImportToNestedAsync(ArchiveEntry entry)
+    {
+        string? folder = await PickFolderAsync("Select Folder");
+        if (folder is null)
+        {
+            return;
+        }
+        try { await RunAsync(ct => _manager.ImportToNestedAsync(entry, folder, ct), $"Imported to {entry.Name}"); }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task ExtractAllAsync(bool nested)
+    {
+        string? folder = await PickFolderAsync("Select Output Folder");
+        if (folder is null)
+        {
+            return;
+        }
+        try
+        {
+            Progress<(int C, int T)> p = new(x => _progressBar.Value = x.C * 100.0 / Math.Max(1, x.T));
+            await RunAsync(ct => _manager.ExtractAllAsync(folder, nested, p, ct), "Extracted");
+        }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task ExtractNestedAsync(ArchiveEntry entry)
+    {
+        string? folder = await PickFolderAsync("Select Output Folder");
+        if (folder is null)
+        {
+            return;
+        }
+        try
+        {
+            Progress<(int C, int T)> p = new(x => _progressBar.Value = x.C * 100.0 / Math.Max(1, x.T));
+            await RunAsync(ct => _manager.ExtractNestedAsync(entry, folder, p, ct), $"Extracted {entry.Name}");
+        }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task ExtractSingleAsync(ArchiveEntry entry)
+    {
+        string? folder = await PickFolderAsync("Select Output Folder");
+        if (folder is null)
+        {
+            return;
+        }
+        try { await RunAsync(ct => _manager.ExtractSingleAsync(entry, folder, ct), $"Extracted {entry.Name}"); }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task ReplaceEntryAsync(ArchiveEntry entry)
+    {
+        string? path = await PickOpenFileAsync("Select File", false);
+        if (path is null)
+        {
+            return;
+        }
+        try
+        {
+            byte[] data = await File.ReadAllBytesAsync(path);
+            _ = await _manager.ReplaceEntryAsync(entry, data);
+            Log($"Replaced {entry.Name}");
+        }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task ReplaceChunkAsync(ArchiveEntry parent, ArchiveEntry chunk)
+    {
+        string? path = await PickOpenFileAsync("Select File", false);
+        if (path is null)
+        {
+            return;
+        }
+        try
+        {
+            byte[] data = await File.ReadAllBytesAsync(path);
+            _ = await _manager.ReplaceChunkAsync(parent, chunk, data);
+            Log($"Replaced {chunk.Name}");
+        }
+        catch (Exception ex) { await DialogService.ShowErrorAsync(this, ex.Message); }
+    }
+    private async Task RenameEntryAsync(ArchiveEntry entry)
+    {
+        string? name = await DialogService.ShowInputDialogAsync(this, "Rename", "Enter new name:", entry.Name);
+        if (string.IsNullOrEmpty(name) || name == entry.Name)
+        {
+            return;
+        }
+        if (_manager.HasDuplicateName(entry, name))
+        {
+            bool proceed = await DialogService.ShowConfirmAsync(this, "Duplicate Name",
+                $"A file named '{name}' already exists at this level. Do you want to continue anyway?");
+            if (!proceed)
+            {
+                return;
+            }
+        }
+        await _manager.RenameEntryAsync(entry, name);
+        Log($"Renamed to {name}");
+    }
+    private async Task AddBlankFileAsync(ArchiveEntry? parent)
+    {
+        string name = GetUniqueName(parent, "new_file", "");
+        await _manager.AddBlankEntryAsync(parent, name, false, null);
+        Log("Added blank file");
+    }
+    private async Task AddBlankContainerAsync(ArchiveEntry? parent, ArchiveType type)
+    {
+        (string baseName, string ext) = type == ArchiveType.DSARC ? ("new_archive", ".dat") : ("new_sound", ".msnd");
+        string name = GetUniqueName(parent, baseName, ext);
+        await _manager.AddBlankEntryAsync(parent, name, true, type);
+        Log($"Added blank {type}");
+    }
+    private string GetUniqueName(ArchiveEntry? parent, string baseName, string ext)
+    {
+        HashSet<string> names = (parent?.Children ?? _manager.Current.RootEntry.Children)
+            .Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        string candidate = $"{baseName}{ext}";
+        if (!names.Contains(candidate))
+        {
+            return candidate;
+        }
+        for (int i = 1; ; i++)
+        {
+            candidate = $"{baseName}_{i}{ext}";
+            if (!names.Contains(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
+    private async Task DeleteEntryAsync(ArchiveEntry entry)
+    {
+        string msg = entry.Children.Count > 0
+            ? $"Delete '{entry.Name}' and {entry.Children.Count} items inside?"
+            : $"Delete '{entry.Name}'?";
+        if (!await DialogService.ShowConfirmAsync(this, "Delete", msg))
+        {
+            return;
+        }
+        await _manager.DeleteEntryAsync(entry);
+        Log($"Deleted {entry.Name}");
+    }
+    private void SaveExpansionState()
+    {
+        if (_rootItem is null)
+        {
+            return;
+        }
+        SaveExpansionStateRecursive(_rootItem);
+    }
+    private void SaveExpansionStateRecursive(TreeViewItem item)
+    {
+        if (item.DataContext is ArchiveEntry entry)
+        {
+            _expansionState[entry.Id] = item.IsExpanded;
+        }
+        if (item.ItemsSource is IEnumerable<TreeViewItem> children)
+        {
+            foreach (TreeViewItem child in children)
+            {
+                SaveExpansionStateRecursive(child);
+            }
+        }
+    }
+    private void RefreshTree()
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            SaveExpansionState();
+            ArchiveDocument doc = _manager.Current;
+            if (!doc.HasContent && doc.FilePath is null)
+            {
+                _treeView.ItemsSource = null;
+                _rootItem = null;
+                UpdateModifiedIndicator();
+                UpdateEditMenu();
+                return;
+            }
+            string rootName = doc.FilePath is not null
+                ? System.IO.Path.GetFileName(doc.FilePath)
+                : doc.FileType == ArchiveType.MSND ? "New DSEQ" : "New DSARC";
+            if (doc.IsModified)
+            {
+                rootName += " *";
+            }
+            _rootItem = new TreeViewItem
+            {
+                Header = CreateHeader(rootName, doc.IsModified),
+                IsExpanded = true,
+                ItemsSource = doc.RootEntry.Children.Select((e, i) => { e.ImportOrder = i; return CreateNode(e); }).ToList()
+            };
+            _treeView.ItemsSource = new[] { _rootItem };
+            UpdateModifiedIndicator();
+            UpdateEditMenu();
+        });
+    }
+    private TreeViewItem CreateNode(ArchiveEntry entry)
+    {
+        string name = entry.IsModified ? $"{entry.Name} *" : entry.Name;
+        bool shouldExpand = !_expansionState.TryGetValue(entry.Id, out bool savedState) || savedState;
+        TreeViewItem node = new()
+        {
+            Header = CreateHeader(name, entry.IsModified),
+            DataContext = entry,
+            IsExpanded = shouldExpand
+        };
+        if (entry.Children.Count > 0)
+        {
+            node.ItemsSource = entry.Children.Select((c, i) => { c.ImportOrder = i; return CreateNode(c); }).ToList();
+        }
+        return node;
+    }
+    private static TextBlock CreateHeader(string text, bool modified)
+    {
+        TextBlock header = new() { Text = text };
+        if (modified)
+        {
+            header.Foreground = ModifiedBrush;
+        }
+        return header;
+    }
+    private void UpdateModifiedIndicator()
+    {
+        _modifiedLabel.Text = _manager.Current.IsModified ? "● Modified" : "";
+    }
+    private void UpdateEditMenu()
+    {
+        _undoMenu.IsEnabled = _manager.CanUndo;
+        _redoMenu.IsEnabled = _manager.CanRedo;
+        _sortMenu.IsEnabled = _manager.Current.FileType == ArchiveType.DSARC && _manager.Current.RootEntry.Children.Count > 1;
+        _sortRecursiveMenu.IsEnabled = _manager.Current.FileType == ArchiveType.DSARC && _manager.HasNestedArchives();
+    }
+    private async Task RunAsync(Func<CancellationToken, Task> action, string msg)
+    {
+        _cts?.Cancel();
+        _cts = new CancellationTokenSource();
+        try
+        {
+            await action(_cts.Token);
+            _statusLabel.Text = msg;
+            Log(msg);
+        }
+        catch (OperationCanceledException) { Log("Cancelled"); }
+        finally { _cts = null; _progressBar.Value = 0; }
+    }
+    private void Log(string msg)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            _logTextBox.Text += $"[{DateTime.Now:HH:mm:ss}] {msg}\n";
+            string text = _logTextBox.Text ?? string.Empty;
+            int lineCount = text.Count(c => c == '\n');
+            if (lineCount > MaxLogLines)
+            {
+                int removeLength = text.IndexOf('\n') + 1;
+                _logTextBox.Text = text[removeLength..];
+            }
+            _logTextBox.CaretIndex = _logTextBox.Text?.Length ?? 0;
+        });
+    }
+}
+
+//Program.cs
+using Avalonia;
+namespace Disgaea_DS_Manager;
+
+public static class Program
+{
+    [STAThread]
+    public static void Main(string[] args)
+    {
+        _ = BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+    }
+    public static AppBuilder BuildAvaloniaApp()
+    {
+        return AppBuilder
+            .Configure<App>()
+            .UsePlatformDetect()
+            .WithInterFont()
+            .LogToTrace();
+    }
+}
+
+//compile.cmd
+@echo off
+setlocal enabledelayedexpansion
+
+:: ============================================
+:: Avalonia Application Publisher
+:: .NET 10 Optimized Build Script
+:: ============================================
+
+echo.
+echo ============================================
+echo     Avalonia Application Publisher
+echo     .NET 10 Optimized Build
+echo ============================================
+echo.
+
+:: Configuration
+set "PUBLISH_DIR=publish"
+set "PROJECT_NAME=Disgaea-DS-Manager"
+set "ERROR_COUNT=0"
+set "START_TIME=%TIME%"
+
+:: Clean previous publish output
+if exist "%PUBLISH_DIR%" (
+    echo [INFO] Cleaning previous publish directory...
+    rmdir /s /q "%PUBLISH_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] Failed to clean publish directory
+        set /a ERROR_COUNT+=1
+    )
+)
+
+:: Function to publish a target
+call :PublishTarget "win-x86" "false" "%PROJECT_NAME%.exe"
+call :PublishTarget "linux-x64" "true" "%PROJECT_NAME%"
+call :PublishTarget "linux-arm64" "true" "%PROJECT_NAME%"
+
+:: Display results
+echo.
+echo ============================================
+if %ERROR_COUNT% EQU 0 (
+    echo   PUBLISH COMPLETED SUCCESSFULLY
+    echo   Output Directory: %PUBLISH_DIR%
+    echo ============================================
+    echo.
+    echo [INFO] Generated artifacts:
+    
+    :: Display file sizes
+    for /f "tokens=*" %%F in ('dir /b /s "%PUBLISH_DIR%\*" ^| findstr /v "\\obj$ \\bin$"') do (
+        if exist "%%F" (
+            for %%I in ("%%F") do (
+                set "filepath=%%~I"
+                set "relpath=!filepath:%PUBLISH_DIR%\=!"
+                echo   !relpath! - %%~zI bytes
+            )
+        )
+    )
+    
+    :: Show build time
+    call :GetTimeDiff "%START_TIME%" "%TIME%" duration
+    echo.
+    echo [INFO] Build time: !duration!
+) else (
+    echo   PUBLISH COMPLETED WITH ERRORS
+    echo   Failed targets: %ERROR_COUNT%
+    echo ============================================
+    echo.
+    echo [ERROR] Check the errors above and try again
+)
+echo.
+pause
+exit /b %ERROR_COUNT%
+
+:: ============================================
+:: Publish Target Function
+:: Parameters: <runtime> <self-contained> <output-name>
+:: ============================================
+:PublishTarget
+set "RUNTIME=%~1"
+set "SELF_CONTAINED=%~2"
+set "OUTPUT_NAME=%~3"
+set "OUTPUT_PATH=%PUBLISH_DIR%\%RUNTIME%"
+
+echo.
+echo ============================================
+echo   Publishing: %RUNTIME%
+echo   Self-contained: %SELF_CONTAINED%
+echo ============================================
+
+set "SELF_CONTAINED_FLAG="
+if /i "%SELF_CONTAINED%"=="true" (
+    set "SELF_CONTAINED_FLAG=--self-contained true"
+)
+
+echo [INFO] Building %RUNTIME% target...
+echo.
+
+dotnet publish -c Release -r %RUNTIME% ^
+  %SELF_CONTAINED_FLAG% ^
+  -p:PublishSingleFile=true ^
+  -p:PublishTrimmed=true ^
+  -p:TrimMode=link ^
+  -p:EnableCompressionInSingleFile=true ^
+  -p:DebugType=none ^
+  -p:DebugSymbols=false ^
+  -p:StripSymbols=true ^
+  -p:IncludeNativeLibrariesForSelfExtract=true ^
+  -p:EnableCompressionInSingleFile=true ^
+  -o "%OUTPUT_PATH%" ^
+  --nologo ^
+  --verbosity minimal
+
+if errorlevel 1 (
+    echo [ERROR] Failed to publish %RUNTIME% target!
+    set /a ERROR_COUNT+=1
+    goto :eof
+)
+
+:: Rename output file if needed
+if exist "%OUTPUT_PATH%\%PROJECT_NAME%.exe" if not "%OUTPUT_NAME%"=="%PROJECT_NAME%.exe" (
+    move "%OUTPUT_PATH%\%PROJECT_NAME%.exe" "%OUTPUT_PATH%\%OUTPUT_NAME%" >nul 2>&1
+)
+if exist "%OUTPUT_PATH%\%PROJECT_NAME%" if not "%OUTPUT_NAME%"=="%PROJECT_NAME%" (
+    move "%OUTPUT_PATH%\%PROJECT_NAME%" "%OUTPUT_PATH%\%OUTPUT_NAME%" >nul 2>&1
+)
+
+echo [SUCCESS] %RUNTIME% published to: %OUTPUT_PATH%
+goto :eof
+
+:: ============================================
+:: Calculate time difference function
+:: ============================================
+:GetTimeDiff
+set "start=%~1"
+set "end=%~2"
+set "result=%~3"
+
+set /a "start_h=1%start:~0,2%%%100, start_m=1%start:~3,2%%%100, start_s=1%start:~6,2%%%100"
+set /a "end_h=1%end:~0,2%%%100, end_m=1%end:~3,2%%%100, end_s=1%end:~6,2%%%100"
+
+set /a "diff_h=end_h-start_h, diff_m=end_m-start_m, diff_s=end_s-start_s"
+
+if %diff_s% lss 0 set /a "diff_s+=60, diff_m-=1"
+if %diff_m% lss 0 set /a "diff_m+=60, diff_h-=1"
+if %diff_h% lss 0 set /a "diff_h+=24"
+
+set "!result!=%diff_h%h %diff_m%m %diff_s%s"
+goto :eof
