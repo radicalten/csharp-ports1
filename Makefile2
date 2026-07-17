@@ -20,7 +20,7 @@ BUILD := build
 TARGET := DisgaeaDSManager
 
 # Source files (root + src/)
-SRC := main.cpp \
+SRC := src2/main.cpp \
       src2/formats.cpp \
       src2/reader.cpp \
       src2/writer.cpp \
