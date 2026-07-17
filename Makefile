@@ -1,6 +1,9 @@
 CXX			:= clang++
 CXXSTD   	:= c++20
 QT_PREFIX := $(shell brew --prefix qt@6 2>/dev/null || echo /opt/homebrew/opt/qt@6)
+MOC      := $(QT_PREFIX)/bin/moc
+RCC      := $(QT_PREFIX)/bin/rcc
+AUTOMOC  := $(MOC)
 CXXFLAGS 	:= -std=$(CXXSTD) -O2 \
             -Iinclude \
 			-F$(QT_PREFIX)/lib \
@@ -12,8 +15,12 @@ LDFLAGS := $(CXXFLAGS) \
             -framework QtWidgets -framework QtCore -framework QtGui \
             -Wl,-rpath,$(QT_PREFIX)/lib \
 			-lm
+# moc-generated sources
+MOC_HDRS := include/main_window.hpp
+MOC_SRCS := $(MOC_HDRS:include/%.hpp=build/moc_%.cpp)
 TARGET  := myapp
+BUILD    := build
 SRCS    := $(wildcard src2/*.cpp)
-OBJS    := $(patsubst %.c,%.o,$(SRCS))
+OBJS    := $(patsubst %.c,%.o,$(SRCS)) $(MOC_SRCS:%.cpp=$(BUILD)/%.o)
 all: $(OBJS)
 	$(CXX) $(OBJS) $(CXXFLAGS) $(LDFLAGS) -o $(TARGET) 
