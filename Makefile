@@ -1,4 +1,5 @@
 CC		:= clang++
+CXXSTD   := c++20
 CFLAGS 	:= -O2
 LDFLAGS := $(CFLAGS) \
 -lm
