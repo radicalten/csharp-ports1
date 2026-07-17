@@ -1,0 +1,27 @@
+name: OSX-14
+on:
+  push:
+    branches:
+    - main
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Install Qt 6
+      run: |
+          brew update
+          brew install qt@6
+    - name: Compile
+      run: |
+        make -f Makefile
+    - name: Create tarball
+      run: |
+        tar -cvf myapp.tgz myapp
+    - name: Upload
+      uses: actions/upload-artifact@v6
+      with:
+        name: Artifact
+        path: |
+          .
