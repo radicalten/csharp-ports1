@@ -1,5 +1,6 @@
 CXX			:= clang++
 CXXSTD   	:= c++20
+QT_PREFIX := $(shell brew --prefix qt@6 2>/dev/null || echo /opt/homebrew/opt/qt@6)
 CXXFLAGS 	:= -std=$(CXXSTD) -O2 \
             -Iinclude \
 			-F$(QT_PREFIX)/lib \
