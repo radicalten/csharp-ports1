@@ -17,7 +17,7 @@ LDFLAGS := $(CXXFLAGS) \
 			-lm
 # moc-generated sources
 MOC_HDRS := include/main_window.hpp
-MOC_SRCS := $(MOC_HDRS:include/%.hpp=build/moc_%.cpp)
+MOC_SRCS := $(MOC_HDRS:include/%.hpp=/moc_%.cpp)
 TARGET  := myapp
 BUILD 	:= build
 SRCS    := $(wildcard src2/*.cpp)
