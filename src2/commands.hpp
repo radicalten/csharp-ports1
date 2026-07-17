@@ -9,6 +9,9 @@
 
 namespace dsm {
 
+// Deep-clone a document (recursive shared_ptr tree copy)
+ArchiveDocument clone_doc(const ArchiveDocument& d);
+
 ArchiveEntryPtr find_by_id(const ArchiveEntryPtr& root, int64_t id);
 ArchiveEntryPtr find_parent(const ArchiveEntryPtr& root, int64_t child_id);
 bool remove_by_id(const ArchiveEntryPtr& parent, int64_t id);
