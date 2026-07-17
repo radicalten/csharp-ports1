@@ -1,0 +1,45 @@
+name: macOS 14 Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6
+        run: |
+          brew update
+          brew install qt@6
+
+      - name: Set Qt Environment
+        run: |
+          echo "QT_PREFIX=$(brew --prefix qt@6)" >> "$GITHUB_ENV"
+          echo "$(brew --prefix qt@6)/bin" >> "$GITHUB_PATH"
+
+      - name: Configure (Make)
+        run: make clean || true
+
+      - name: Build
+        run: make -f Makefile2
+        env:
+          CXX: clang++
+
+      - name: Verify Binary
+        run: |
+          test -f ./DisgaeaDSManager && echo "Build OK"
+          file ./DisgaeaDSManager
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisgaeaDSManager-macos14
+          path: DisgaeaDSManager
+          retention-days: 30
