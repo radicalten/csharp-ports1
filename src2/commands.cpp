@@ -58,7 +58,7 @@ void populate_msnd_modified(const std::vector<uint8_t>& msnd, ArchiveEntryPtr en
     mk(".swar", o.swar_offset, o.swar_size);
 }
 
-static ArchiveDocument clone_doc(const ArchiveDocument& d) {
+ArchiveDocument clone_doc(const ArchiveDocument& d) {
     ArchiveDocument out = d;
     // shallow clone of root with deep children
     std::function<ArchiveEntryPtr(const ArchiveEntryPtr&)> clone =
