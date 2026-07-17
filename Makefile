@@ -19,7 +19,27 @@ LDFLAGS := $(CXXFLAGS) \
 MOC_HDRS := include/main_window.hpp
 MOC_SRCS := $(MOC_HDRS:include/%.hpp=build/moc_%.cpp)
 TARGET  := myapp
+BUILD 	:= build
 SRCS    := $(wildcard src2/*.cpp)
-OBJS    := $(patsubst %.c,%.o,$(SRCS)) $(MOC_SRCS:%.cpp=build/%.o)
+OBJS    := $(patsubst %.c,%.o,$(SRCS)) $(MOC_SRCS:%.cpp=$(BUILD)%.o)
 all: $(OBJS)
+
+# Run moc on headers
+$(BUILD)/moc_%.cpp: include/%.hpp | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(MOC) $< -o $@
+
+# Compile regular sources
+$(BUILD)/%.o: %.cpp | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Compile moc sources
+$(BUILD)/moc_%.o: $(BUILD)/moc_%.cpp | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 	$(CXX) $(OBJS) $(CXXFLAGS) $(LDFLAGS) -o $(TARGET) 
+
+$(BUILD):
+	@mkdir -p $(BUILD)/src
