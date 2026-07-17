@@ -1,10 +1,10 @@
-CC		:= clang++
-CXXSTD   := c++20
-CFLAGS 	:= -O2
+CXX			:= clang++
+CXXSTD   	:= c++20
+CXXFLAGS 	:= -std=$(CXXSTD) -O2
 LDFLAGS := $(CFLAGS) \
 -lm
 TARGET  := myapp
 SRCS    := $(wildcard src2/*.cpp)
 OBJS    := $(patsubst %.c,%.o,$(SRCS))
 all: $(OBJS)
-	$(CC) $(OBJS) $(CFLAGS) $(LDFLAGS) -o $(TARGET) 
+	$(CXX) $(OBJS) $(CXXFLAGS) $(LDFLAGS) -o $(TARGET) 
