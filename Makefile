@@ -1,4 +1,4 @@
-CC		:= g++
+CC		:= clang++
 CFLAGS 	:= -O2
 LDFLAGS := $(CFLAGS) \
 -lm
