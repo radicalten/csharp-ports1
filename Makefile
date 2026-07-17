@@ -16,8 +16,8 @@ LDFLAGS := $(CXXFLAGS) \
             -Wl,-rpath,$(QT_PREFIX)/lib \
 			-lm
 # moc-generated sources
-MOC_HDRS := include/main_window.hpp
-MOC_SRCS := $(MOC_HDRS:include/%.hpp=/moc_%.cpp)
+MOC_HDRS := src2/include/main_window.hpp
+MOC_SRCS := $(MOC_HDRS:src2/include/%.hpp=/moc_%.cpp)
 TARGET  := myapp
 BUILD 	:= build
 SRCS    := $(wildcard src2/*.cpp)
@@ -25,7 +25,7 @@ OBJS    := $(patsubst %.c,%.o,$(SRCS)) $(MOC_SRCS:%.cpp=$(BUILD)%.o)
 all: $(OBJS)
 
 # Run moc on headers
-$(BUILD)/moc_%.cpp: include/%.hpp | $(BUILD)
+$(BUILD)/moc_%.cpp: src2/include/%.hpp | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(MOC) $< -o $@
 
